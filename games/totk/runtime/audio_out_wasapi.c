@@ -58,6 +58,7 @@ struct AudioOut {
 };
 
 const char *audio_out_backend(void) { return "WASAPI"; }
+static AudioOut *g_current;   /* the open output (one per process) */
 
 /* ---- default-device notifications (IMMNotificationClient in C) ---- */
 #define NOTIFY_OWNER(p) ((AudioOut *)((char *)(p) - offsetof(AudioOut, notify)))
@@ -81,6 +82,20 @@ static HRESULT STDMETHODCALLTYPE n_prop(IMMNotificationClient *self, LPCWSTR id,
 static IMMNotificationClientVtbl notify_vtbl = {n_query, n_addref, n_release, n_state, n_added, n_removed, n_default, n_prop};
 
 /* ---- device ---- */
+/* The output endpoint: TOTK_AUDIO_DEVICE (an endpoint id from audio_out_list_devices, set by the in-game menu) when that
+   device is present and active, else the system default. */
+static HRESULT get_endpoint(AudioOut *o, IMMDevice **dev) {
+    const char *want = getenv("TOTK_AUDIO_DEVICE");
+    if (want && *want) {
+        wchar_t id[512];
+        if (MultiByteToWideChar(CP_UTF8, 0, want, -1, id, 512) && SUCCEEDED(IMMDeviceEnumerator_GetDevice(o->enumerator, id, dev))) {
+            DWORD st = 0;
+            if (SUCCEEDED(IMMDevice_GetState(*dev, &st)) && st == DEVICE_STATE_ACTIVE) return S_OK;
+            IMMDevice_Release(*dev); *dev = NULL;
+        }
+    }
+    return IMMDeviceEnumerator_GetDefaultAudioEndpoint(o->enumerator, eRender, eConsole, dev);
+}
 static void device_close(AudioOut *o) {
     if (o->client) IAudioClient_Stop(o->client);
     if (o->render) { IAudioRenderClient_Release(o->render); o->render = NULL; }
@@ -103,7 +118,7 @@ static int describe_mix(AudioOut *o, const WAVEFORMATEX *w) {
 
 static int device_open(AudioOut *o, int quiet) {
     IMMDevice *dev = NULL; WAVEFORMATEX *mix = NULL; HRESULT hr;
-    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(o->enumerator, eRender, eConsole, &dev);
+    hr = get_endpoint(o, &dev);
     if (FAILED(hr)) { if (!quiet) fprintf(stderr, "[totk-audio] 【红】no default output device (0x%08lx): mixing without sound\n", (unsigned long)hr); return 0; }
     hr = IMMDevice_Activate(dev, &TOTK_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&o->client);
     IMMDevice_Release(dev);
@@ -122,7 +137,7 @@ static int device_open(AudioOut *o, int quiet) {
     else {
         /* 2. The device mix format, converted here (same rate only: no resampler of our own). */
         IAudioClient_Release(o->client); o->client = NULL;
-        hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(o->enumerator, eRender, eConsole, &dev);
+        hr = get_endpoint(o, &dev);
         if (FAILED(hr)) goto fail;
         hr = IMMDevice_Activate(dev, &TOTK_IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&o->client);
         IMMDevice_Release(dev);
@@ -201,7 +216,7 @@ static DWORD WINAPI audio_thread(void *arg) {
         /* Device gone or default changed: rebuild on the current default device, retrying while there is none. */
         int had = o->client != NULL;
         device_close(o);
-        if (device_open(o, !had)) fprintf(stderr, "[totk-audio] WASAPI output rebuilt on the default device (%llu)\n", (unsigned long long)++o->rebuilds);
+        if (device_open(o, !had)) fprintf(stderr, "[totk-audio] WASAPI output rebuilt on the %s device (%llu)\n", getenv("TOTK_AUDIO_DEVICE") && *getenv("TOTK_AUDIO_DEVICE") ? "chosen" : "default", (unsigned long long)++o->rebuilds);
         else if (had) fprintf(stderr, "[totk-audio] WASAPI output lost: retrying every 0.5 s\n");
     }
 out:
@@ -245,6 +260,7 @@ AudioOut *audio_out_open(int rate, int channels, audio_out_pull_fn pull, void *c
     o->stop = CreateEventW(NULL, TRUE, FALSE, NULL); o->rebuild = CreateEventW(NULL, FALSE, FALSE, NULL);
     o->ready = CreateEventW(NULL, TRUE, FALSE, NULL); o->event = CreateEventW(NULL, FALSE, FALSE, NULL);
     if (!o->stop || !o->rebuild || !o->ready || !o->event || !thread_start(o)) { out_free(o); return NULL; }
+    g_current = o;
     return o;
 }
 int audio_out_restart(AudioOut *o, int recreate) {
@@ -255,6 +271,40 @@ int audio_out_restart(AudioOut *o, int recreate) {
 }
 void audio_out_close(AudioOut *o) {
     if (!o) return;
+    if (g_current == o) g_current = NULL;
     thread_stop(o); out_free(o);
+}
+
+/* The in-game menu (runtime/overlay): after TOTK_AUDIO_DEVICE changed, rebuild the open output on that device. */
+void audio_out_switch_device(void) { AudioOut *o = g_current; if (o && o->rebuild) SetEvent(o->rebuild); }
+
+/* Active output devices: names (friendly names, UTF-8) and ids (for TOTK_AUDIO_DEVICE). Any thread. */
+static const PROPERTYKEY TOTK_PKEY_Device_FriendlyName = {{0xa45c254e, 0xdf1c, 0x4efd, {0x80, 0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0}}, 14};
+int audio_out_list_devices(char (*names)[128], char (*ids)[256], int max) {
+    HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    IMMDeviceEnumerator *en = NULL; IMMDeviceCollection *col = NULL; UINT n = 0; int out = 0;
+    if (SUCCEEDED(CoCreateInstance(&TOTK_CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &TOTK_IID_IMMDeviceEnumerator, (void **)&en)) &&
+        SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &col)) && SUCCEEDED(IMMDeviceCollection_GetCount(col, &n))) {
+        for (UINT i = 0; i < n && out < max; i++) {
+            IMMDevice *d = NULL; LPWSTR id = NULL; IPropertyStore *ps = NULL;
+            if (FAILED(IMMDeviceCollection_Item(col, i, &d))) continue;
+            if (SUCCEEDED(IMMDevice_GetId(d, &id))) {
+                PROPVARIANT pv; PropVariantInit(&pv);
+                names[out][0] = 0;
+                if (SUCCEEDED(IMMDevice_OpenPropertyStore(d, STGM_READ, &ps)) && SUCCEEDED(IPropertyStore_GetValue(ps, &TOTK_PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
+                    WideCharToMultiByte(CP_UTF8, 0, pv.pwszVal, -1, names[out], 128, NULL, NULL);
+                PropVariantClear(&pv);
+                if (ps) IPropertyStore_Release(ps);
+                if (!names[out][0]) snprintf(names[out], 128, "Device %u", i + 1);
+                WideCharToMultiByte(CP_UTF8, 0, id, -1, ids[out], 256, NULL, NULL);
+                CoTaskMemFree(id); out++;
+            }
+            IMMDevice_Release(d);
+        }
+    }
+    if (col) IMMDeviceCollection_Release(col);
+    if (en) IMMDeviceEnumerator_Release(en);
+    if (SUCCEEDED(co)) CoUninitialize();
+    return out;
 }
 #endif /* _WIN32 */

@@ -22,3 +22,8 @@ int audio_out_restart(AudioOut *out, int recreate);
 void audio_out_close(AudioOut *out);
 /* "CoreAudio", "WASAPI": for log lines. */
 const char *audio_out_backend(void);
+#ifdef _WIN32
+/* Output device choice (in-game menu): the active devices, and a rebuild of the open output after TOTK_AUDIO_DEVICE changed. */
+int audio_out_list_devices(char (*names)[128], char (*ids)[256], int max);
+void audio_out_switch_device(void);
+#endif

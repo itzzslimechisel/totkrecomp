@@ -25,6 +25,10 @@ extern "C" {
 void runtime_input_clear(void);
 void runtime_gamepad_clear(void);
 int gamepad_sdl_mouse_enabled(void);
+void audio_set_volume(int pct);
+void audio_set_mute(int on);
+int audio_out_list_devices(char (*names)[128], char (*ids)[256], int max);
+void audio_out_switch_device(void);
 }
 
 namespace {
@@ -206,6 +210,17 @@ static void set_fps_target(int i) {
     settings_ini_set("TOTK_UNCAPPED_HZ", i == 1 ? "60" : i == 2 ? "120" : nullptr);
 }
 
+/* Output devices, listed when the Audio tab is shown (index 0 = the system default). */
+static char g_devNames[16][128], g_devIds[16][256];
+static int g_ndev = -1;
+static void refresh_devices() { g_ndev = audio_out_list_devices(g_devNames, g_devIds, 16); if (g_ndev < 0) g_ndev = 0; }
+static int device_index() {   /* 0 = default, i + 1 = g_devIds[i]; -1 = a saved device that is not present */
+    std::string cur = env("TOTK_AUDIO_DEVICE");
+    if (cur.empty()) return 0;
+    for (int i = 0; i < g_ndev; i++) if (cur == g_devIds[i]) return i + 1;
+    return -1;
+}
+
 static std::vector<Row> tab_rows(int tab) {
     std::vector<Row> r;
     if (tab == 0) {   /* Game */
@@ -232,6 +247,26 @@ static std::vector<Row> tab_rows(int tab) {
         Row fc; fc.label = "FPS counter"; fc.value = kFpsModes[g_fpsMode < 0 ? 0 : g_fpsMode];
         fc.change = [](int d) { set_fps_mode((g_fpsMode + d + 3) % 3); };
         r.push_back(fc);
+    } else if (tab == 2) {   /* Audio */
+        if (g_ndev < 0) refresh_devices();
+        Row vol; vol.label = "Volume"; { int v = env("TOTK_VOLUME").empty() ? 100 : atoi(env("TOTK_VOLUME").c_str()); char b[16]; snprintf(b, sizeof b, "%d %%", v); vol.value = b; }
+        vol.change = [](int d) {
+            int v = env("TOTK_VOLUME").empty() ? 100 : atoi(env("TOTK_VOLUME").c_str());
+            v = v + 5 * d; v = v < 0 ? 0 : v > 100 ? 100 : v;
+            char b[16]; snprintf(b, sizeof b, "%d", v);
+            settings_ini_set("TOTK_VOLUME", v >= 100 ? nullptr : b); audio_set_volume(v);
+        };
+        r.push_back(vol);
+        Row mute; mute.label = "Mute"; mute.value = env("TOTK_MUTE") == "1" ? "On" : "Off";
+        mute.change = [](int) { bool on = env("TOTK_MUTE") != "1"; settings_ini_set("TOTK_MUTE", on ? "1" : nullptr); audio_set_mute(on); };
+        r.push_back(mute);
+        Row dev; dev.label = "Output device"; { int i = device_index(); dev.value = i == 0 ? "System default" : i > 0 ? g_devNames[i - 1] : "(saved device not connected)"; }
+        dev.change = [](int d) {
+            int n = g_ndev + 1, i = device_index(); i = ((i < 0 ? 0 : i) + d + n) % n;
+            settings_ini_set("TOTK_AUDIO_DEVICE", i ? g_devIds[i - 1] : nullptr);
+            audio_out_switch_device();
+        };
+        r.push_back(dev);
     }
     return r;
 }
@@ -243,8 +278,8 @@ enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_TAB_PREV, NAV_TAB_NEXT
 static std::vector<int> g_nav;
 static int g_sel, g_tab;
 static bool g_mouseMoved; static ImVec2 g_mouseAtOpen(-1, -1);
-static const char *kTabs[] = {"Game", "Video"};
-static const int kNumTabs = 2;
+static const char *kTabs[] = {"Game", "Video", "Audio"};
+static const int kNumTabs = 3;
 static bool nav_key(const SDL_Event &e) {   /* render thread: true if the key is ours */
     if (e.type != SDL_EVENT_KEY_DOWN && e.type != SDL_EVENT_KEY_UP) return false;
     int a = -1;
@@ -355,7 +390,7 @@ extern "C" int overlay_vk_draw(const overlay_vk_frame *f) {
     if (g_accNs >= 500000000ull) { g_fps = g_accFrames * 1e9f / g_accNs; g_ms = g_accNs / 1e6f / g_accFrames; g_accNs = 0; g_accFrames = 0; }
     if (g_fpsMode < 0) g_fpsMode = fps_mode_setting();
     bool open = g_open.load();
-    { static bool was; if (open && !was) { g_sel = 1; g_tab = 0; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
+    { static bool was; if (open && !was) { g_sel = 1; g_tab = 0; g_ndev = -1; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
     if (!open) { std::lock_guard<std::mutex> l(g_qmu); g_q.clear(); g_confirmQuit = false; }
     if (!g_win || (!open && !g_fpsMode) || f->image_index >= 8) return 0;
     if (!g_ready) { if (!init_imgui(f)) { g_win = nullptr; fprintf(stderr, "[totk-menu] initialization failed: menu off\n"); return 0; } g_ready = true; }

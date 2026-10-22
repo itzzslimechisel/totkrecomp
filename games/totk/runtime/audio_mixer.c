@@ -20,11 +20,17 @@
 #include <string.h>
 
 static void pull_raw(void *ctx, float *out, uint32_t frames);
-/* TOTK_VOLUME (0-100, default 100): master output gain applied to what the device pulls. */
+/* TOTK_VOLUME (0-100, default 100): master output gain applied to what the device pulls; audio_set_volume (the in-game
+   menu) changes it while playing, audio_set_mute silences without stopping the device. */
+static _Atomic int g_volume = -1, g_mute;
+void audio_set_volume(int pct) { atomic_store(&g_volume, pct < 0 ? 0 : pct > 100 ? 100 : pct); }
+void audio_set_mute(int on) { atomic_store(&g_mute, on != 0); }
 static void pull(void *ctx, float *out, uint32_t frames) {
-    static float gain = -1.0f;
     pull_raw(ctx, out, frames);
-    if (gain < 0) { const char *e = getenv("TOTK_VOLUME"); int v = e && *e ? atoi(e) : 100; gain = v < 0 ? 0.0f : v > 100 ? 1.0f : (float)v / 100.0f; gain *= gain; }
+    int v = atomic_load(&g_volume);
+    if (v < 0) { const char *e = getenv("TOTK_VOLUME"); v = e && *e ? atoi(e) : 100; v = v < 0 ? 0 : v > 100 ? 100 : v; atomic_store(&g_volume, v);
+                 const char *m = getenv("TOTK_MUTE"); if (m && !strcmp(m, "1")) atomic_store(&g_mute, 1); }   /* TOTK_MUTE=1: the menu's Mute */
+    float gain = atomic_load(&g_mute) ? 0.0f : (float)v / 100.0f; gain *= gain;
     if (gain < 0.9999f) for (uint32_t i = 0; i < frames * 2; i++) out[i] *= gain;
 }
 
