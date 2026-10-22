@@ -288,14 +288,14 @@ static std::vector<Row> tab_rows(int tab) {
                                    settings_ini_set("TOTK_TRIGGER_THRESHOLD", v == 25 ? nullptr : s); gamepad_sdl_set_trigger_threshold(v); };
         r.push_back(tr);
         Row ru; ru.label = "Rumble"; ru.value = env("TOTK_RUMBLE") == "0" ? "Off" : "On";
-        ru.change = [](int) { bool on = env("TOTK_RUMBLE") == "0"; settings_ini_set("TOTK_RUMBLE", on ? nullptr : "0"); runtime_hid_feedback_flag("rumble", on); };
+        ru.change = [](int) { bool on = env("TOTK_RUMBLE") == "0"; runtime_hid_feedback_flag("rumble", on); settings_ini_set("TOTK_RUMBLE", on ? nullptr : "0");   /* the flag reads the old setting */ };
         r.push_back(ru);
         Row rg; rg.label = "Rumble strength"; { double g = env("TOTK_RUMBLE_GAIN").empty() ? 1.0 : atof(env("TOTK_RUMBLE_GAIN").c_str()); snprintf(b, sizeof b, "%d %%", (int)(g * 100 + 0.5)); rg.value = b; }
         rg.change = [](int d) { double g = env("TOTK_RUMBLE_GAIN").empty() ? 1.0 : atof(env("TOTK_RUMBLE_GAIN").c_str()); int p = (int)(g * 100 + 0.5) + 25 * d; p = p < 25 ? 25 : p > 200 ? 200 : p;
                                 char s[16]; snprintf(s, sizeof s, "%.2f", p / 100.0); settings_ini_set("TOTK_RUMBLE_GAIN", p == 100 ? nullptr : s); gamepad_feedback_set_gain(p / 100.0f); };
         r.push_back(rg);
         Row gy; gy.label = "Motion controls (gyro)"; gy.value = env("TOTK_GYRO") == "0" ? "Off" : "On";
-        gy.change = [](int) { bool on = env("TOTK_GYRO") == "0"; settings_ini_set("TOTK_GYRO", on ? nullptr : "0"); runtime_hid_feedback_flag("gyro", on); };
+        gy.change = [](int) { bool on = env("TOTK_GYRO") == "0"; runtime_hid_feedback_flag("gyro", on); settings_ini_set("TOTK_GYRO", on ? nullptr : "0");   /* the flag reads the old setting */ };
         r.push_back(gy);
         Row mo; mo.label = "Mouse aims (right stick)"; mo.value = env("TOTK_MOUSE") == "1" ? "On" : "Off";
         mo.change = [](int) { bool on = env("TOTK_MOUSE") != "1"; settings_ini_set("TOTK_MOUSE", on ? "1" : nullptr); request_main(REQ_MOUSE, 1); };
