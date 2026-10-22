@@ -6,6 +6,7 @@
    - the game patches (game_patches*.c) are applied to main before its text is sealed;
    - nn::init::Start runs on the main guest thread with the same host callbacks as loader.c's boot.
    Usage: totk-win <exefs dir> boot   (TOTK_ROMFS etc. as on the Mac; TOTK_HEADLESS: no window). */
+#include "win/settings_ini.h"
 #include "runtime.h"
 #include "jit_glue.h"
 #include "game_patches.h"
@@ -435,6 +436,10 @@ static void boot(void) {
 int main(int argc, char **argv) {
     _set_fmode(_O_BINARY);
     setvbuf(stderr, NULL, _IONBF, 0);
+    {   /* <package>\settings.ini (launcher + in-game menu); variables already in the environment win */
+        int n = settings_ini_load();
+        if (n >= 0) fprintf(stderr, "[totk] settings: %s (%d set from the file)\n", settings_ini_path(), n);
+    }
     if (argc == 3 && !strcmp(argv[1], "--vk-caps")) {   /* tools/windows/prepare_shaders.py: <cache>/vk-caps.json, the GPU's translator caps */
         extern void mtl_init(void);
         setenv("TOTK_VK_NO_WINDOW", "1", 1); setenv("TOTK_SHADER_CACHE", argv[2], 1);
