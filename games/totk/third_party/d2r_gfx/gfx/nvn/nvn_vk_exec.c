@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <direct.h>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -56,10 +57,82 @@ static void barrier_full(VkCommandBuffer cb) {
     VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb};
     vkCmdPipelineBarrier2(cb, &di);
 }
+/* Render-target dump (diagnostics): TOTK_VK_DUMP_RT=<present number>[,<folder>] copies every colour attachment of every
+   render pass of that frame to an RGBA8 image (a blit in the command stream, so the frame is not disturbed) and writes
+   them as <folder>/rt_<pass>_<attachment>_<w>x<h>_nvn<format>_vk<format>.png after the frame is presented. Float values
+   are clamped to 0..1 by the blit; integer formats are skipped. */
+typedef struct { VkImage img; VmaAllocation al; uint32_t w, h; int pass, att, nvn_fmt, vk_fmt; } rt_dump;
+static int fmt_is_int(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_A2B10G10R10_SINT_PACK32: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT: case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: return 1;
+        default: return 0;
+    }
+}
+void mtl_finish(void);
+static rt_dump g_rtd[512]; static int g_nrtd, g_rtd_pass, g_rtd_log; static long g_rtd_at = -1; static char g_rtd_dir[512];
+uint64_t mtl_present_count(void);
+static int rtd_armed(void) {
+    if (g_rtd_at == -1) {
+        const char *e = getenv("TOTK_VK_DUMP_RT"); g_rtd_at = e && *e ? atol(e) : 0;
+        const char *c = e ? strchr(e, ',') : NULL; snprintf(g_rtd_dir, sizeof g_rtd_dir, "%s", c ? c + 1 : "rt-dump");
+    }
+    return g_rtd_log = g_rtd_at > 0 && mtl_present_count() + 1 == (uint64_t)g_rtd_at;
+}
+static void rtd_capture(VkCommandBuffer cb) {
+    g_rtd_pass++;
+    for (uint32_t i = 0; i < P.ncolor && g_nrtd < 512; i++) {
+        vk_tex *x = P.ctex[i]; if (!x || !x->img) continue;
+        VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.phys, x->fmt, &fp);
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) || fmt_is_int(x->fmt)) continue;
+        rt_dump *d = &g_rtd[g_nrtd];
+        VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, {P.w, P.h, 1}, 1, 1, VK_SAMPLE_COUNT_1_BIT,
+            VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, VK_IMAGE_LAYOUT_UNDEFINED};
+        VmaAllocationCreateInfo ai = {0}; ai.usage = VMA_MEMORY_USAGE_AUTO;
+        if (vmaCreateImage(V.vma, &ci, &ai, &d->img, &d->al, NULL) != VK_SUCCESS) continue;
+        VkImageMemoryBarrier2 b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0, 0, d->img, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &b};
+        vkCmdPipelineBarrier2(cb, &di);
+        VkImageBlit bl = {{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)P.w, (int32_t)P.h, 1}}, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {{0, 0, 0}, {(int32_t)P.w, (int32_t)P.h, 1}}};
+        vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, d->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+        d->w = P.w; d->h = P.h; d->pass = g_rtd_pass; d->att = (int)i; d->nvn_fmt = x->t.d.format; d->vk_fmt = x->fmt;
+        g_nrtd++;
+    }
+    barrier_full(cb);
+}
+int nvn_vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) __attribute__((weak));
+void vk_rt_dump_flush(void) {   /* nvn_vk_dev.c, at the present after the dumped frame */
+    if (!g_nrtd || !nvn_vk_write_png) return;
+    mtl_finish();
+    _mkdir(g_rtd_dir);
+    for (int k = 0; k < g_nrtd; k++) {
+        rt_dump *d = &g_rtd[k];
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)d->w * d->h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer buf; VmaAllocation bal; VmaAllocationInfo inf;
+        if (vmaCreateBuffer(V.vma, &bi, &bai, &buf, &bal, &inf) == VK_SUCCESS) {
+            VkCommandBuffer cb = vk_oneoff_begin();
+            VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {d->w, d->h, 1}};
+            vkCmdCopyImageToBuffer(cb, d->img, VK_IMAGE_LAYOUT_GENERAL, buf, 1, &c);
+            vk_oneoff_end(cb);
+            uint8_t *px = inf.pMappedData; for (size_t i = 0; i < (size_t)d->w * d->h; i++) px[4 * i + 3] = 255;
+            char p[1024]; snprintf(p, sizeof p, "%s/rt_%03d_%d_%ux%u_nvn%02x_vk%d.png", g_rtd_dir, d->pass, d->att, d->w, d->h, d->nvn_fmt, d->vk_fmt);
+            nvn_vk_write_png(p, px, d->w, d->h);
+            vmaDestroyBuffer(V.vma, buf, bal);
+        }
+        vmaDestroyImage(V.vma, d->img, d->al);
+    }
+    VKLOG("render-target dump: %d attachments of %d passes -> %s", g_nrtd, g_rtd_pass, g_rtd_dir);
+    g_nrtd = 0; g_rtd_at = 0;
+}
 static void pass_end(void) {
     if (!P.open) return;
     vkCmdEndRendering(CB()); P.open = 0;
     barrier_full(CB());
+    if (rtd_armed()) rtd_capture(CB());
 }
 void vk_exec_end_all(void) { pass_end(); }
 void vk_exec_sub_begin(void) {
@@ -458,12 +531,17 @@ static void write_stage(wset *ws, VkDescriptorSet sets[2], vk_shader *sh, int st
                     int tid = reg < 128 ? (int)(S.tex[st][reg] & 0xfffff) : 0;
                     const view_t *v = NULL; int hv = 0; vk_tex *x = tid ? vk_tex_by_id(tid, &v, &hv) : NULL;
                     if (x && x->img) iv = vk_tex_view_typed(x, v, hv, want_vt(b), 0);
+                    if (rtd_armed())
+                        VKLOG("rtdump pass %d stage %d slot %d (dim %d arr %d): %s %ux%ux%u layers %u levels %u nvn %#x vk %d decoded %d", g_rtd_pass + 1, st, reg, b->dim, b->arrayed,
+                              !tid ? "no texture" : !x ? "texture id not found" : !iv ? "NO VIEW (dummy)" : "ok", x ? x->w : 0, x ? x->h : 0, x ? x->d : 0, x ? x->layers : 0, x ? x->levels : 0,
+                              x ? x->t.d.format : 0, x ? x->fmt : 0, x ? x->decoded : 0);
                     if (!iv) iv = vk_dummy_view(b->dim > 3 ? 1 : b->dim, b->arrayed, b->ms, b->cls, 0);
                 }
                 if (b->desc == VKD_COMBINED || b->desc == VKD_SAMPLER) {
                     int sk = b->desc == VKD_SAMPLER ? b->kind : b->samp_kind, sr = b->desc == VKD_SAMPLER ? reg : b->samp_reg;
                     int sid = sr < 128 ? (int)((sk == NVN_RB_SAMP ? S.samp[st][sr] : S.tex[st][sr]) >> 20) : 0;
                     sp = sid ? vk_sampler_get(sid) : vk_sampler_default();
+                    if (rtd_armed()) { const char *vk_sampler_desc(int); VKLOG("rtdump pass %d stage %d slot %d sampler %d (kind %d reg %d): %s", g_rtd_pass + 1, st, reg, sid, sk, sr, sid ? vk_sampler_desc(sid) : "none (default linear)"); }
                 }
                 if (b->desc == VKD_UTEXEL) {
                     int tid = reg < 128 ? (int)(S.tex[st][reg] & 0xfffff) : 0; const view_t *v; int hv;

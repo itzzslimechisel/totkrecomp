@@ -10,6 +10,7 @@
 #include "nvn_deswizzle.h"
 #include "nvn_bcdec.h"
 #include "nvn_astc_dec.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -374,6 +375,15 @@ VkSampler vk_sampler_get(int sid) {
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { p = g_sreg[sid]; ok = 1; }
     pthread_mutex_unlock(&g_rmu);
     return ok ? samp_make(&p) : vk_sampler_default();
+}
+/* "min <f> mag <f> wrap <s>/<t>/<r>" of a registered sampler (diagnostics); "unregistered" otherwise. */
+const char *vk_sampler_desc(int sid) {
+    static char buf[96]; samp_par p; int ok = 0;
+    pthread_mutex_lock(&g_rmu);
+    if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) { p = g_sreg[sid]; ok = 1; }
+    pthread_mutex_unlock(&g_rmu);
+    if (ok) snprintf(buf, sizeof buf, "min %d mag %d wrap %d/%d/%d", p.minf, p.magf, p.ws, p.wt, p.wr); else snprintf(buf, sizeof buf, "unregistered (default linear)");
+    return buf;
 }
 VkSampler vk_sampler_default(void) {
     samp_par p = {NVN_MIN_FILTER_LINEAR, NVN_MAG_FILTER_LINEAR, NVN_WRAP_MODE_CLAMP_TO_EDGE, NVN_WRAP_MODE_CLAMP_TO_EDGE, NVN_WRAP_MODE_CLAMP_TO_EDGE, 0, 0, 0, 0, 1000, 0, 1, {0, 0, 0, 0}, 0};

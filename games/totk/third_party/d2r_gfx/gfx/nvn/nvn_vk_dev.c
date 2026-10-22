@@ -587,6 +587,7 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     present_shot(t, ticket);
+    { void vk_rt_dump_flush(void); vk_rt_dump_flush(); }
     { void vk_pcache_tick(uint64_t); vk_pcache_tick(ticket); }
     { void vk_pipe_budget_reset(void); vk_pipe_budget_reset(); }
     if (ticket % 600 == 0) { void vk_pipe_stats(uint64_t *, uint64_t *, int *); uint64_t made, ns; int pend; vk_pipe_stats(&made, &ns, &pend);
