@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+#include <stdatomic.h>
 #include "runtime.h"
 #include "frontend_sdl.h"
 #include "gamepad_sdl_map.h"
@@ -50,9 +52,33 @@ static void load_controller_map(void) {
     fprintf(stderr, "[totk-input] controller layout: %s (%d buttons changed)\n", path, changed);
 }
 
+/* Stick deadzone and trigger threshold in percent (TOTK_STICK_DEADZONE, default 12 = gamepad_modes.h's 0.12;
+   TOTK_TRIGGER_THRESHOLD, default 25 = GAMEPAD_SDL_TRIGGER_PRESSED); the in-game menu changes them while playing. */
+static _Atomic int deadPct = -1, trigPct = -1;
+static int env_pct(const char *name, int def, int lo, int hi) {
+    const char *e = getenv(name); int v = e && *e ? atoi(e) : def;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+void gamepad_sdl_set_deadzone(int pct) { atomic_store(&deadPct, pct < 0 ? 0 : pct > 40 ? 40 : pct); }
+void gamepad_sdl_set_trigger_threshold(int pct) { atomic_store(&trigPct, pct < 5 ? 5 : pct > 95 ? 95 : pct); }
+static float deadzone(void) {
+    int v = atomic_load(&deadPct);
+    if (v < 0) { v = env_pct("TOTK_STICK_DEADZONE", 12, 0, 40); atomic_store(&deadPct, v); }
+    return v / 100.0f;
+}
+static int32_t trigger_threshold(void) {
+    int v = atomic_load(&trigPct);
+    if (v < 0) { v = env_pct("TOTK_TRIGGER_THRESHOLD", 25, 5, 95); atomic_store(&trigPct, v); }
+    return (int32_t)(v * 32767 / 100);
+}
 static int32_t axis(SDL_Gamepad *g, SDL_GamepadAxis a, int invert) {
     float v = SDL_GetGamepadAxis(g, a) / 32767.0f;
-    return gamepad_stick_axis(invert ? -v : v);   /* SDL: y grows downward; the Switch (and GameController): upward */
+    if (invert) v = -v;   /* SDL: y grows downward; the Switch (and GameController): upward */
+    float dz = deadzone(), m = fabsf(v);   /* gamepad_stick_axis with the chosen deadzone: the rest rescaled to full range */
+    if (!(m > dz)) return 0;
+    if (m > 1.0f) m = 1.0f;
+    int32_t r = (int32_t)((m - dz) / (1.0f - dz) * 32767.0f);
+    return v < 0 ? -r : r;
 }
 
 static void refresh(void) {
@@ -66,8 +92,8 @@ static void refresh(void) {
         for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++) down[b] = SDL_GetGamepadButton(g, (SDL_GamepadButton)b);
         int labels[4];
         for (int b = 0; b < 4; b++) labels[b] = SDL_GetGamepadButtonLabel(g, (SDL_GamepadButton)b);
-        physical |= gamepad_sdl_physical(down, labels, SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER),
-                                         SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), pads[i].by_position);
+        int32_t thr = trigger_threshold(), lt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER), rt = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER);
+        physical |= gamepad_sdl_physical(down, labels, lt > thr ? 32767 : 0, rt > thr ? 32767 : 0, pads[i].by_position);
         next.lx = gamepad_stronger_axis(next.lx, axis(g, SDL_GAMEPAD_AXIS_LEFTX, 0));
         next.ly = gamepad_stronger_axis(next.ly, axis(g, SDL_GAMEPAD_AXIS_LEFTY, 1));
         next.rx = gamepad_stronger_axis(next.rx, axis(g, SDL_GAMEPAD_AXIS_RIGHTX, 0));
@@ -129,6 +155,13 @@ int gamepad_sdl_mouse_enabled(void) {
     return mouseOn;
 }
 void gamepad_sdl_mouse_motion(float dx, float dy) { mouseDx += dx; mouseDy += dy; }
+/* In-game menu (main thread): mouse as right stick on / off and its sensitivity (TOTK_MOUSE_SENS, stick units per pixel). */
+void gamepad_sdl_set_mouse(int on, float sens) {
+    gamepad_sdl_mouse_enabled();
+    mouseOn = on != 0;
+    if (sens > 0 && sens <= 100000) mouseGain = sens;
+    if (!mouseOn) { mouseButtons = 0; mouseRx = mouseRy = 0; mouseDx = mouseDy = 0; refresh(); }
+}
 void gamepad_sdl_mouse_button(int sdl_button, int down) {
     int bit = sdl_button == SDL_BUTTON_LEFT ? 9 : sdl_button == SDL_BUTTON_RIGHT ? 8 : sdl_button == SDL_BUTTON_MIDDLE ? 5 : -1;
     if (bit < 0) return;

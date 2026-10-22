@@ -27,6 +27,7 @@ static uint64_t wantAt[2], wantCount;
 /* main thread */
 static SDL_Gamepad *rumblePad, *motionPad;
 static float gain = 1.0f; static int gainRead;
+void gamepad_feedback_set_gain(float g) { if (g > 0 && g <= 4) { gain = g; gainRead = 1; } }   /* in-game menu (TOTK_RUMBLE_GAIN) */
 static float sent[2] = {-1, -1};
 static uint64_t sentAt, lastTick, wantCountLogged, lastLog;
 static float acc[3]; static int accSeen;

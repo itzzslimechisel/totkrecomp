@@ -29,6 +29,11 @@ void audio_set_volume(int pct);
 void audio_set_mute(int on);
 int audio_out_list_devices(char (*names)[128], char (*ids)[256], int max);
 void audio_out_switch_device(void);
+void gamepad_sdl_set_deadzone(int pct);
+void gamepad_sdl_set_trigger_threshold(int pct);
+void gamepad_sdl_set_mouse(int on, float sens);
+void gamepad_feedback_set_gain(float g);
+int runtime_hid_feedback_flag(const char *name, int v);
 }
 
 namespace {
@@ -49,7 +54,7 @@ VkDevice g_dev;
 int g_fpsMode = -1;          /* 0 off, 1 FPS, 2 FPS + frame time */
 std::atomic<bool> g_confirmQuit{false};   /* main thread (B) and render thread */
 /* Window actions asked for by the render thread (menu items) and done by the SDL main thread (overlay_main_tick). */
-enum { REQ_TOGGLE = 1, REQ_FULLSCREEN = 2, REQ_WINSIZE = 4 };
+enum { REQ_TOGGLE = 1, REQ_FULLSCREEN = 2, REQ_WINSIZE = 4, REQ_MOUSE = 8 };
 std::atomic<int> g_req{0}, g_reqFullscreen{0};
 std::atomic<bool> g_fullscreen{false};    /* the window's state, kept by the main thread */
 std::atomic<bool> g_swapRecreate{false};  /* VSync changed: the backend makes a new swapchain after this present */
@@ -97,6 +102,10 @@ extern "C" void overlay_main_tick(void) {   /* SDL main thread, each loop */
     int r = g_req.exchange(0);
     if (r & REQ_TOGGLE) overlay_toggle();
     if (r & REQ_FULLSCREEN) { SDL_SetWindowFullscreen(g_win, g_reqFullscreen.load() != 0); g_fullscreen = g_reqFullscreen.load() != 0; }
+    if (r & REQ_MOUSE) {   /* the relative mouse mode follows when the menu closes (overlay_toggle) */
+        const char *m = getenv("TOTK_MOUSE"), *s = getenv("TOTK_MOUSE_SENS");
+        gamepad_sdl_set_mouse(m && !strcmp(m, "1"), s && *s ? (float)atof(s) : 1200.0f);
+    }
     if ((r & REQ_WINSIZE) && !g_fullscreen) {
         const char *e = getenv("TOTK_WINDOW_SIZE"); int w = 0, h = 0;
         if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 180) { SDL_SetWindowSize(g_win, w, h); SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED); }
@@ -267,6 +276,38 @@ static std::vector<Row> tab_rows(int tab) {
             audio_out_switch_device();
         };
         r.push_back(dev);
+    } else if (tab == 3) {   /* Controls */
+        auto pct = [](const char *k, int def) { std::string v = env(k); return v.empty() ? def : atoi(v.c_str()); };
+        char b[32];
+        Row dz; dz.label = "Stick deadzone"; snprintf(b, sizeof b, "%d %%", pct("TOTK_STICK_DEADZONE", 12)); dz.value = b;
+        dz.change = [pct](int d) { int v = pct("TOTK_STICK_DEADZONE", 12) + 2 * d; v = v < 0 ? 0 : v > 30 ? 30 : v; char s[8]; snprintf(s, sizeof s, "%d", v);
+                                   settings_ini_set("TOTK_STICK_DEADZONE", v == 12 ? nullptr : s); gamepad_sdl_set_deadzone(v); };
+        r.push_back(dz);
+        Row tr; tr.label = "Trigger press point"; snprintf(b, sizeof b, "%d %%", pct("TOTK_TRIGGER_THRESHOLD", 25)); tr.value = b;
+        tr.change = [pct](int d) { int v = pct("TOTK_TRIGGER_THRESHOLD", 25) + 5 * d; v = v < 5 ? 5 : v > 90 ? 90 : v; char s[8]; snprintf(s, sizeof s, "%d", v);
+                                   settings_ini_set("TOTK_TRIGGER_THRESHOLD", v == 25 ? nullptr : s); gamepad_sdl_set_trigger_threshold(v); };
+        r.push_back(tr);
+        Row ru; ru.label = "Rumble"; ru.value = env("TOTK_RUMBLE") == "0" ? "Off" : "On";
+        ru.change = [](int) { bool on = env("TOTK_RUMBLE") == "0"; settings_ini_set("TOTK_RUMBLE", on ? nullptr : "0"); runtime_hid_feedback_flag("rumble", on); };
+        r.push_back(ru);
+        Row rg; rg.label = "Rumble strength"; { double g = env("TOTK_RUMBLE_GAIN").empty() ? 1.0 : atof(env("TOTK_RUMBLE_GAIN").c_str()); snprintf(b, sizeof b, "%d %%", (int)(g * 100 + 0.5)); rg.value = b; }
+        rg.change = [](int d) { double g = env("TOTK_RUMBLE_GAIN").empty() ? 1.0 : atof(env("TOTK_RUMBLE_GAIN").c_str()); int p = (int)(g * 100 + 0.5) + 25 * d; p = p < 25 ? 25 : p > 200 ? 200 : p;
+                                char s[16]; snprintf(s, sizeof s, "%.2f", p / 100.0); settings_ini_set("TOTK_RUMBLE_GAIN", p == 100 ? nullptr : s); gamepad_feedback_set_gain(p / 100.0f); };
+        r.push_back(rg);
+        Row gy; gy.label = "Motion controls (gyro)"; gy.value = env("TOTK_GYRO") == "0" ? "Off" : "On";
+        gy.change = [](int) { bool on = env("TOTK_GYRO") == "0"; settings_ini_set("TOTK_GYRO", on ? nullptr : "0"); runtime_hid_feedback_flag("gyro", on); };
+        r.push_back(gy);
+        Row mo; mo.label = "Mouse aims (right stick)"; mo.value = env("TOTK_MOUSE") == "1" ? "On" : "Off";
+        mo.change = [](int) { bool on = env("TOTK_MOUSE") != "1"; settings_ini_set("TOTK_MOUSE", on ? "1" : nullptr); request_main(REQ_MOUSE, 1); };
+        r.push_back(mo);
+        Row ms; ms.label = "Mouse sensitivity"; { int s = env("TOTK_MOUSE_SENS").empty() ? 1200 : atoi(env("TOTK_MOUSE_SENS").c_str()); snprintf(b, sizeof b, "%d", s / 12); ms.value = b; }
+        ms.change = [](int d) { int s = env("TOTK_MOUSE_SENS").empty() ? 1200 : atoi(env("TOTK_MOUSE_SENS").c_str()); s += 120 * d; s = s < 240 ? 240 : s > 4800 ? 4800 : s;
+                                char t[16]; snprintf(t, sizeof t, "%d", s); settings_ini_set("TOTK_MOUSE_SENS", s == 1200 ? nullptr : t); request_main(REQ_MOUSE, 1); };
+        r.push_back(ms);
+        static const Choice faces[] = {{"Automatic", ""}, {"By label (A is A)", "label"}, {"By position (Nintendo)", "position"}};
+        Row fb; fb.label = "Face buttons"; fb.next_start = true; { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); fb.value = faces[i < 0 ? 0 : i].label; }
+        fb.change = [](int d) { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); i = ((i < 0 ? 0 : i) + d + 3) % 3; settings_ini_set("TOTK_FACE_BUTTONS", faces[i].value[0] ? faces[i].value : nullptr); };
+        r.push_back(fb);
     }
     return r;
 }
@@ -278,8 +319,8 @@ enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_TAB_PREV, NAV_TAB_NEXT
 static std::vector<int> g_nav;
 static int g_sel, g_tab;
 static bool g_mouseMoved; static ImVec2 g_mouseAtOpen(-1, -1);
-static const char *kTabs[] = {"Game", "Video", "Audio"};
-static const int kNumTabs = 3;
+static const char *kTabs[] = {"Game", "Video", "Audio", "Controls"};
+static const int kNumTabs = 4;
 static bool nav_key(const SDL_Event &e) {   /* render thread: true if the key is ours */
     if (e.type != SDL_EVENT_KEY_DOWN && e.type != SDL_EVENT_KEY_UP) return false;
     int a = -1;
