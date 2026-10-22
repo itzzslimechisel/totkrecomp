@@ -435,6 +435,14 @@ static void boot(void) {
 int main(int argc, char **argv) {
     _set_fmode(_O_BINARY);
     setvbuf(stderr, NULL, _IONBF, 0);
+    if (argc == 3 && !strcmp(argv[1], "--vk-caps")) {   /* tools/windows/prepare_shaders.py: <cache>/vk-caps.json, the GPU's translator caps */
+        extern void mtl_init(void);
+        setenv("TOTK_VK_NO_WINDOW", "1", 1); setenv("TOTK_SHADER_CACHE", argv[2], 1);
+        mtl_init();
+        char p[1200]; snprintf(p, sizeof p, "%s/vk-caps.json", argv[2]);
+        FILE *f = fopen(p, "rb"); if (f) fclose(f);
+        _exit(f ? 0 : 1);
+    }
     need(argc == 3, "usage: totk-win <exefs dir> boot");
     SetUnhandledExceptionFilter(crash_filter);
     AddVectoredExceptionHandler(0, first_chance);

@@ -32,7 +32,8 @@ def stats(frames_ms):
     total = sum(s)
     worst = s[-max(1, n // 100):]           # the slowest 1 % of frames
     return {'frames': n, 'avg_fps': round(1000.0 * n / total, 2), 'low1_fps': round(1000.0 / (sum(worst) / len(worst)), 2),
-            'p50_ms': round(s[n // 2], 2), 'p99_ms': round(s[min(n - 1, n * 99 // 100)], 2), 'max_ms': round(s[-1], 2)}
+            'p50_ms': round(s[n // 2], 2), 'p99_ms': round(s[min(n - 1, n * 99 // 100)], 2), 'max_ms': round(s[-1], 2),
+            'over50ms': sum(1 for x in s if x > 50)}
 
 
 def main():

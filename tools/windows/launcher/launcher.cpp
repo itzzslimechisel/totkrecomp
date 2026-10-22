@@ -114,7 +114,11 @@ static void check_data() {
 }
 static void check_dotnet() {
     chk.dotnet = false;
-    S x = get("TOTK_XLATE", "dotnet.exe");
+    S x = get("TOTK_XLATE");
+    if (x.empty()) {   /* the bundled NativeAOT translator (bin\xlate): no .NET runtime needed */
+        if (exists(here + L"bin\\xlate\\totk_xlate.exe")) { chk.dotnet = true; chk.dotnetMsg = "Shader translator: bundled (no .NET needed)"; return; }
+        x = "dotnet.exe";
+    }
     if (_stricmp(x.c_str(), "dotnet.exe") && _stricmp(x.c_str(), "dotnet")) { chk.dotnet = true; chk.dotnetMsg = "custom shader translator command"; return; }
     wchar_t exe[1024];
     if (!SearchPathW(NULL, L"dotnet.exe", NULL, 1024, exe, NULL)) {
@@ -190,13 +194,14 @@ static S launch_game(const WS &logName = L"totk.log") {
     }
     if (!chk.vulkan) return chk.vulkanMsg;
     for (auto &p : kv) setv(p.first.c_str(), expand(p.second));
-    S xlate = expand(get("TOTK_XLATE", "dotnet.exe"));
+    S xlate = expand(get("TOTK_XLATE"));
     S h = U(here);
     setv("TOTK_ROMFS", U(romfs_dir()));
     setv("TOTK_ROMFS_INDEX", h + "bin\\runtime-index.bin");
     setv("TOTK_PROFILE_DIR", h + "user-data");
     setv("TOTK_SHADER_CACHE", h + "shader-cache");
-    setv("TOTK_XLATE_CMD", "\"" + xlate + "\" \"" + h + "bin\\translator\\totk_xlate.dll\"");
+    if (xlate.empty() && exists(here + L"bin\\xlate\\totk_xlate.exe")) setv("TOTK_XLATE_CMD", "\"" + h + "bin\\xlate\\totk_xlate.exe\"");
+    else setv("TOTK_XLATE_CMD", "\"" + (xlate.empty() ? S("dotnet.exe") : xlate) + "\" \"" + h + "bin\\translator\\totk_xlate.dll\"");
     /* the runtime treats "variable set" as on for these; the settings file stores explicit 0 / 1 */
     if (get("TOTK_AUDIO_OFF") != "1") SetEnvironmentVariableW(L"TOTK_AUDIO_OFF", NULL);
     if (get("TOTK_VK_VSYNC_OFF") != "1") SetEnvironmentVariableW(L"TOTK_VK_VSYNC_OFF", NULL);
@@ -331,6 +336,13 @@ static void guess_keys() {
 }
 static WS profile_dir() { return here + L"user-data"; }
 
+/* "Prepare shaders" (support\prepare_shaders.py through totk_setup.py): the shared shader list translated from the game
+   files into <package>\shader-cache before play. Done once per package; resumable. */
+static bool shaders_prepared(const WS &pkg) { return exists(pkg + L"shader-cache\\prepared.json"); }
+static void job_shaders(WS pkg) {
+    logline("Preparing shaders from your game files (one time; takes a few minutes, uses all CPU cores) ...");
+    run_helper(L"shaders --pkg " + q(U(pkg)));
+}
 static void job_import(S base, S upd, S keys, S out) {
     WS common = L"--base " + q(base) + (upd.empty() ? L"" : L" --update " + q(upd)) + L" --keys " + q(keys) + L" --output " + q(out);
     logline("Checking the game version ...");
@@ -349,6 +361,7 @@ static void job_import(S base, S upd, S keys, S out) {
     if (run_helper(L"import " + common)) return;
     if (target == here) { put("TOTK_DATA", okOut); profileNote = "Imported game version " + disp + "."; save_settings(); } else set_data_in(target, okOut);
     check_data();
+    job_shaders(target);
 }
 static void job_adopt(S ex, S ro, S out) {
     WS common = L"--exefs " + q(ex) + L" --romfs " + q(ro) + L" --output " + q(out);
@@ -362,6 +375,7 @@ static void job_adopt(S ex, S ro, S out) {
     if (run_helper(L"adopt " + common)) return;
     if (target == here) { put("TOTK_DATA", resData); save_settings(); profileNote = "Using game version " + disp + "."; } else set_data_in(target, resData);
     check_data();
+    job_shaders(target);
 }
 
 /* ---------- widgets ---------- */
@@ -403,6 +417,12 @@ static void page_play() {
     status_line(chk.data, chk.dataMsg);
     status_line(chk.vulkan, chk.vulkanMsg);
     status_line(chk.dotnet, chk.dotnetMsg);
+    if (chk.data) {
+        bool prep = shaders_prepared(here);
+        status_line(prep, prep ? "Shaders prepared" : "Shaders not prepared yet: without them effects are missing and the game stutters the first time they appear");
+        if (!prep || running) { ImGui::SameLine(); if (running) ImGui::BeginDisabled(); if (ImGui::Button("Prepare shaders")) start_job([] { job_shaders(here); }); if (running) ImGui::EndDisabled(); }
+        if (running) job_bar();
+    }
     if (!profileNote.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", profileNote.c_str()); if (!profileOpen.empty() && ImGui::Button("Open that package")) { WS exe = profileOpen + L"Tears of the Kingdom.exe"; ShellExecuteW(NULL, L"open", exe.c_str(), L"--setup", profileOpen.c_str(), SW_SHOWNORMAL); PostQuitMessage(0); } }
     ImGui::Spacing(); ImGui::Spacing();
     bool can = chk.data && chk.vulkan && chk.dotnet && !running;

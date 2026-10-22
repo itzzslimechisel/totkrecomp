@@ -41,6 +41,7 @@ APP = 'Tears of the Kingdom'
 VERSIONS = {'1.0.0': ('v0', True), '1.1.1': ('v111', True), '1.1.2': ('v112', False), '1.2.0': ('v120', True),
             '1.2.1': ('v121', False), '1.4.3': ('v143', True)}
 TRANSLATOR_DEFAULT = REPO / 'build' / 'totk_xlate-win'
+TRANSLATOR_AOT_DEFAULT = TRANSLATOR_DEFAULT / 'aot-win-x64'   # build_win.ps1 -Aot: no .NET runtime needed
 
 
 def say(msg):
@@ -139,8 +140,8 @@ rem Set to 1 to run without sound.
 set "TOTK_AUDIO_OFF=0"
 rem Mouse as right stick and ZR/ZL/R3 buttons: remove "rem" on the next line.
 rem set "TOTK_MOUSE=1"
-rem Shader translator host (needs the .NET 10 runtime: https://dotnet.microsoft.com/download/dotnet/10.0).
-set "TOTK_XLATE=dotnet.exe"
+rem Shader translator: empty = the bundled native one (bin\xlate). dotnet.exe = the .NET build in bin\translator (needs the .NET 10 runtime).
+set "TOTK_XLATE="
 '''
 
 LAUNCHER = r'''@echo off
@@ -152,7 +153,8 @@ set "TOTK_ROMFS=%TOTK_DATA%\extracted\@VER@\romfs"
 set "TOTK_ROMFS_INDEX=%HERE%bin\runtime-index.bin"
 set "TOTK_PROFILE_DIR=%HERE%user-data"
 set "TOTK_SHADER_CACHE=%HERE%shader-cache"
-set "TOTK_XLATE_CMD="%TOTK_XLATE%" "%HERE%bin\translator\totk_xlate.dll""
+set "TOTK_XLATE_CMD="%HERE%bin\xlate\totk_xlate.exe""
+if defined TOTK_XLATE set "TOTK_XLATE_CMD="%TOTK_XLATE%" "%HERE%bin\translator\totk_xlate.dll""
 if "%TOTK_AUDIO_OFF%"=="0" set "TOTK_AUDIO_OFF="
 if not exist "%TOTK_ROMFS%\romfs.bin" (echo Game data @DISPLAY@ not found in "%TOTK_DATA%\extracted\@VER@". Edit settings.bat. & pause & exit /b 1)
 pushd "%HERE%"
@@ -182,7 +184,7 @@ def embedded_python():
     import zipfile
     v = '%d.%d.%d' % sys.version_info[:3]
     root = REPO / 'build' / 'python-embed' / v
-    if (root / 'site-packages' / 'lz4').is_dir() and (root / 'python.exe').is_file():
+    if (root / 'site-packages' / 'zstandard').is_dir() and (root / 'site-packages' / 'lz4').is_dir() and (root / 'python.exe').is_file():
         return root
     shutil.rmtree(root, ignore_errors=True)
     root.mkdir(parents=True)
@@ -194,7 +196,7 @@ def embedded_python():
         zf.extractall(root)
     z.unlink()
     run([sys.executable, '-m', 'pip', 'install', '--quiet', '--target', root / 'site-packages', '--only-binary=:all:', '--platform', 'win_amd64',
-         '--python-version', '%d.%d' % sys.version_info[:2], 'cryptography', 'lz4'])
+         '--python-version', '%d.%d' % sys.version_info[:2], 'cryptography', 'lz4', 'zstandard'])
     for pth in root.glob('python*._pth'):   # embeddable Python ignores PYTHONPATH: list what the helper needs (paths relative to this file)
         pth.write_text(pth.read_text().replace('#import site', 'import site') + 'site-packages\n..\n../games/totk/scripts\n')
     return root
@@ -206,12 +208,13 @@ def build_support(pkg, shared_with=None):
     py = embedded_python()
     for src, dst in [(REPO / 'tools/windows/launcher/support/totk_setup.py', 'totk_setup.py'), (REPO / 'tools/windows/import_game.py', 'tools/windows/import_game.py'),
                      (REPO / 'build_app.py', 'build_app.py')] + \
-                    [(REPO / 'games/totk/scripts' / f, f'games/totk/scripts/{f}') for f in ('extract_exefs.py', 'extract_romfs.py', 'prepare_modules.py')] + \
+                    [(REPO / 'games/totk/scripts' / f, f'games/totk/scripts/{f}') for f in ('extract_exefs.py', 'extract_romfs.py', 'prepare_modules.py', 'prepare_shader_seed.py', 'shader_list.py')] + \
+                    [(REPO / 'tools/windows/prepare_shaders.py', 'prepare_shaders.py'), (REPO / 'games/totk/assets/shader_list.tsv', 'games/totk/assets/shader_list.tsv')] + \
                     [(p, f'games/totk/assets/{p.name}') for p in sorted((REPO / 'games/totk/assets').glob('expected-v*.json'))] +                     [(REPO / 'games/botw/assets' / f, f'games/botw/assets/{f}') for f in ('expected-v1.6.0.json', 'shader_list.tsv')]:   # build_app.py reads them at import
         (sup / dst).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, sup / dst)
     target = sup / 'python'
-    if not (target / 'python.exe').is_file() or (target / 'site-packages' / 'lz4').exists() is False:
+    if not (target / 'python.exe').is_file() or not (target / 'site-packages' / 'zstandard').exists():
         link_tree(py, target, shared_with / 'python' if shared_with else None)
     return sup
 
@@ -231,6 +234,7 @@ def main():
     ap.add_argument('--data-dir', type=Path, help='keep the game data in this import output folder (holding extracted/) instead of <package>/data; without base/-k it only reuses it')
     ap.add_argument('--prebuilt', type=Path, help='folder with totk-win.exe and runtime-index.bin (or gen/runtime-index.bin) built for this version: copy instead of building')
     ap.add_argument('--translator', type=Path, default=TRANSLATOR_DEFAULT, help='folder with the published totk_xlate.dll')
+    ap.add_argument('--translator-aot', type=Path, default=TRANSLATOR_AOT_DEFAULT, help='folder with the NativeAOT totk_xlate.exe (build_win.ps1 -Aot)')
     ap.add_argument('--romfs', choices=('full', 'index', 'none'), default='full', help='passed to import_game.py')
     ap.add_argument('--no-shortcut', action='store_true')
     ap.add_argument('--dry-run', action='store_true', help='print the plan only')
@@ -298,10 +302,21 @@ def main():
     (pkg / 'bin/game-version.txt').write_text(f'{display} {vdir}\n')
     siblings = [p / 'bin/translator' for p in out.iterdir() if p.is_dir() and p != pkg and (p / 'bin/translator/totk_xlate.dll').is_file()]
     link_tree(a.translator, pkg / 'bin/translator', siblings[0] if siblings else None)
+    aot = a.translator_aot / 'totk_xlate.exe'
+    if aot.is_file():   # the native translator the game uses by default (TOTK_XLATE empty)
+        (pkg / 'bin/xlate').mkdir(exist_ok=True)
+        shutil.copy2(aot, pkg / 'bin/xlate/totk_xlate.exe')
+    else:
+        say(f'warning: no NativeAOT translator at {aot} (build_win.ps1 -Aot): the package needs the .NET 10 runtime')
     rel = '%~dp0data' if not a.data_dir else str(data)
     settings = pkg / 'settings.bat'
     if not settings.exists():   # keep the player's edits on a re-run
         write_bat(settings, SETTINGS.replace('@APP@', name).replace('@VER@', vdir).replace('@DISPLAY@', display).replace('@DATA@', rel))
+    elif (pkg / 'bin/xlate/totk_xlate.exe').is_file():   # older packages: dotnet.exe was the only translator host
+        old = settings.read_text(encoding='utf-8', errors='replace').replace('\r\n', '\n')
+        old = old.replace('rem Shader translator host (needs the .NET 10 runtime: https://dotnet.microsoft.com/download/dotnet/10.0).\nset "TOTK_XLATE=dotnet.exe"\n',
+                          SETTINGS[SETTINGS.index('rem Shader translator:'):])
+        write_bat(settings, old)
     launcher = pkg / f'{name}.bat'
     write_bat(launcher, LAUNCHER.replace('@VER@', vdir).replace('@DISPLAY@', display))
     if not a.no_shortcut and os.name == 'nt':

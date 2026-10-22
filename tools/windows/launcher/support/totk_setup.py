@@ -327,6 +327,8 @@ def main():
     p.add_argument('--profile', required=True)
     p = sub.add_parser('save-path')
     p.add_argument('--profile', required=True)
+    p = sub.add_parser('shaders', help='prepare shaders: translate the shared shader list from the game files (prepare_shaders.py)')
+    p.add_argument('--pkg', required=True)
     a = ap.parse_args()
     try:
         if a.cmd in ('detect', 'import'):
@@ -337,6 +339,13 @@ def main():
             if a.cmd == 'import':
                 out('@@progress 1')
                 out('@@done Import finished')
+        elif a.cmd == 'shaders':
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import prepare_shaders
+            sys.argv = ['prepare_shaders.py', '--pkg', a.pkg]
+            rc = prepare_shaders.main()
+            if rc:
+                sys.exit(rc)
         else:
             {'adopt': cmd_adopt, 'save-import': cmd_save_import, 'save-export': cmd_save_export, 'save-path': cmd_save_path}[a.cmd](a)
     except SystemExit:
