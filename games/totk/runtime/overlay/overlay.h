@@ -17,6 +17,7 @@ typedef struct SDL_Window SDL_Window;
 void overlay_init(SDL_Window *window);      /* after the window exists */
 int overlay_event(const SDL_Event *e);      /* 1 = consumed by the menu (do not pass it to the game) */
 void overlay_toggle(void);
+void overlay_main_tick(void);              /* each main-loop pass: window actions asked for by the menu */
 int overlay_open(void);                     /* any thread */
 
 /* render thread: one call per present, recording into cb after the game picture was blitted to the swapchain image
@@ -30,7 +31,7 @@ typedef struct {
     uint32_t format, width, height;                      /* VkFormat of the swapchain, its extent */
     uint64_t swapchain_generation;                       /* changes when the swapchain is recreated */
 } overlay_vk_frame;
-int overlay_vk_draw(const overlay_vk_frame *f);         /* 1 if it recorded anything */
+int overlay_vk_draw(const overlay_vk_frame *f);         /* bit 0: recorded something; bit 1: recreate the swapchain (VSync changed) */
 
 #ifdef __cplusplus
 }
