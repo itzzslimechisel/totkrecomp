@@ -166,10 +166,43 @@ static void index_load_file(const char *path, const char *key) {
     }
     fclose(f);
 }
+/* <cache>/index.tsv: every variant in one file ("<key>\t<variant>\t<depth_minus_w>\t<deps>"), written by
+   tools/windows/prepare_shaders.py and appended to during play. Opening the per-shader .variants.tsv files one by one
+   took minutes on a freshly prepared cache (20 000 cold opens; Windows checks the drive and scans each file), so they
+   are read only when index.tsv is missing (an older cache), and index.tsv is written from them then. */
+static int index_load_combined(const char *path) {
+    FILE *f = fopen(path, "rb"); if (!f) return -1;
+    static char line[16384]; int n = 0;
+    while (fgets(line, sizeof line, f)) {
+        line[strcspn(line, "\r\n")] = 0;
+        char *t1 = strchr(line, '\t'); if (!t1 || t1 - line != 64) continue; *t1 = 0;
+        char *t2 = strchr(t1 + 1, '\t'); if (!t2) continue; *t2 = 0;
+        char *t3 = strchr(t2 + 1, '\t'); if (!t3) continue; *t3 = 0;
+        index_add(line, t1 + 1, atoi(t2 + 1), t3 + 1); n++;
+    }
+    fclose(f);
+    return n;
+}
+static void index_write_combined(const char *path) {   /* under g_rt_mu */
+    char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *f = fopen(tmp, "wb"); if (!f) return;
+    for (int h = 0; h < KHASH; h++)
+        for (kent *e = g_keys[h]; e; e = e->next)
+            for (vrec *r = e->v; r; r = r->next) fprintf(f, "%s\t%s\t%d\t%s\n", e->key, r->variant, r->dmw, r->deps_text);
+    if (fclose(f) == 0) { remove(path); rename(tmp, path); } else remove(tmp);
+}
 /* All index files, before the first frame (mtl_init). */
 void nvn_vk_shader_index_load(void) {
     static int done; if (done) return; done = 1;
     uint64_t t0 = vk_now_ns(); int files = 0;
+    char comb[1200]; snprintf(comb, sizeof comb, "%s/index.tsv", cache_dir());
+    pthread_mutex_lock(&g_rt_mu);
+    int lines = index_load_combined(comb);
+    pthread_mutex_unlock(&g_rt_mu);
+    if (lines >= 0) {
+        VKLOG("shader cache %s: %d variants from index.tsv in %.0f ms", cache_dir(), g_index_entries, (vk_now_ns() - t0) / 1e6);
+        return;
+    }
 #ifdef _WIN32
     char pat[1100]; snprintf(pat, sizeof pat, "%s/*.variants.tsv", cache_dir());
     WIN32_FIND_DATAA fd; HANDLE h = FindFirstFileA(pat, &fd);
@@ -183,6 +216,7 @@ void nvn_vk_shader_index_load(void) {
         } while (FindNextFileA(h, &fd));
         FindClose(h);
     }
+    if (files) index_write_combined(comb);   /* the next start reads one file */
     pthread_mutex_unlock(&g_rt_mu);
 #endif
     VKLOG("shader cache %s: %d shaders, %d variants indexed in %.0f ms", cache_dir(), files, g_index_entries, (vk_now_ns() - t0) / 1e6);
@@ -251,6 +285,8 @@ static int translate(job *j) {   // worker thread, g_rt_mu not held
     deps[dl] = 0;
     char ip[1200]; snprintf(ip, sizeof ip, "%s/%s.variants.tsv", cache_dir(), j->key);
     FILE *idx = fopen(ip, "ab"); if (idx) { fprintf(idx, "%s\t%d\t%s\n", j->variant, j->dmw, deps); fclose(idx); }
+    snprintf(ip, sizeof ip, "%s/index.tsv", cache_dir());
+    idx = fopen(ip, "ab"); if (idx) { fprintf(idx, "%s\t%s\t%d\t%s\n", j->key, j->variant, j->dmw, deps); fclose(idx); }
     pthread_mutex_lock(&g_rt_mu); index_add(j->key, j->variant, j->dmw, deps); g_translated++; pthread_mutex_unlock(&g_rt_mu);
     contribute(j->key, deps);
     if (g_translated <= 8 || g_translated % 100 == 0) VKLOG("[shader] translated %llu during play: %s %s", (unsigned long long)g_translated, sn, j->variant);

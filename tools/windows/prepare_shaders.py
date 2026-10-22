@@ -124,6 +124,17 @@ def load_index(cache):
     return idx
 
 
+def write_combined_index(cache, index):
+    """<cache>/index.tsv: every variant in one file (key, variant, depth_minus_w, deps), which the runtime reads at start
+    instead of opening each .variants.tsv (nvn_vk_rt.c nvn_vk_shader_index_load)."""
+    tmp = cache / 'index.tsv.tmp'
+    with open(tmp, 'w', encoding='utf-8', newline='\n') as f:
+        for key in sorted(index):
+            for deps, variant in index[key].items():
+                f.write(f'{key}\t{variant}\t{DMW}\t{deps}\n')
+    os.replace(tmp, cache / 'index.tsv')
+
+
 def inventory(romfs, cache, wanted_keys, locators):
     """(stage, control, code) of every shader the list needs; kept in <cache>/prepare-inventory.bin (local game data, never
     shipped) so that a resumed run does not scan the RomFS again."""
@@ -197,6 +208,7 @@ def main():
     marker = cache / 'prepared.json'   # the launcher shows the shaders as prepared when this names the current list
     list_sha = __import__('hashlib').sha256(Path(a.list or LIST).read_bytes()).hexdigest()
     if not total:
+        write_combined_index(cache, index)
         marker.write_text(json.dumps(dict(list_sha256=list_sha, version=ver)))
         say('@@progress 1'); say('@@done Shaders are prepared.'); return 0
     by_key = {}
@@ -278,6 +290,7 @@ def main():
     done_f.close()
     for e in errors[:5]:
         say('  failed: ' + e[:300])
+    write_combined_index(cache, index)
     marker.write_text(json.dumps(dict(list_sha256=list_sha, version=ver, translated=counts[0], failed=counts[1])))
     say('@@progress 1')
     say(f'@@done Shaders are prepared: {counts[0]} translated, {counts[1]} could not be translated, {time.monotonic() - t0:.0f} s.')
