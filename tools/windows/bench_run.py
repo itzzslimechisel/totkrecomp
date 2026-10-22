@@ -69,11 +69,13 @@ def main():
             shutil.copytree(pkg / 'user-data', profile, ignore=shutil.ignore_patterns('save-backups'))
     cmds = out / 'input.txt'; cmds.write_text('')
     tsv = out / 'frames.tsv'; log = out / 'totk.log'
+    xlate, aot = st.get('TOTK_XLATE', ''), pkg / 'bin' / 'xlate' / 'totk_xlate.exe'
+    xlate_cmd = f'"{aot}"' if not xlate and aot.is_file() else f'"{xlate or "dotnet.exe"}" "{pkg / "bin" / "translator" / "totk_xlate.dll"}"'
     env = os.environ.copy()
     env.update({k: v for k, v in st.items() if k.startswith('TOTK_')})
     env.update({'TOTK_ROMFS': str(data / 'romfs'), 'TOTK_ROMFS_INDEX': str(pkg / 'bin' / 'runtime-index.bin'),
                 'TOTK_PROFILE_DIR': str(profile), 'TOTK_SHADER_CACHE': a.shader_cache or str(pkg / 'shader-cache'),
-                'TOTK_XLATE_CMD': f'"{st.get("TOTK_XLATE", "dotnet.exe")}" "{pkg / "bin" / "translator" / "totk_xlate.dll"}"',
+                'TOTK_XLATE_CMD': xlate_cmd,
                 'DM_NVN_TSV': str(tsv), 'DM_NVN_TSV_CALLS': '0', 'TOTK_INPUT_FILE': str(cmds)})
     if st.get('TOTK_AUDIO_OFF') == '0':
         env.pop('TOTK_AUDIO_OFF', None)
