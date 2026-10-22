@@ -1,10 +1,11 @@
-/* "Tears of the Kingdom.exe": launcher + first-run setup UI for a package folder (see build_windows.py).
-   - Normal start: reads settings.bat, starts bin\totk-win.exe with stderr in logs\totk.log, waits, reports problems.
-   - Setup UI (first run, game data missing, Shift held at start, or --setup): Dear ImGui over Direct3D 11.
-     Pages: Play, Game files (NSP/XCI + prod.keys import, or an extracted exefs + romfs pair), Settings (writes settings.bat),
+/* "Tears of the Kingdom.exe": launcher + setup for a package folder (see build_windows.py).
+   - The window always opens (Dear ImGui over Direct3D 11). First run: one setup screen (NSP/XCI + update + prod.keys +
+     data folder, one "Set up" button: import, verify, prepare shaders; resumable; done = game files + shaders prepared).
+     Then: Play (big PLAY button), Game files (import / adopt, run setup again, delete), Settings (settings.ini + .bat),
      Saves (import / export / open folder), Controls.
-   - Long jobs (import, save import/export) run support\totk_setup.py with the bundled Python (support\python) and show its output.
-   Options: --setup  --tab <0-4>  --play (launch without UI even when data is missing: error box). */
+   - PLAY starts bin\totk-win.exe with stderr in logs\totk.log, waits, reports problems.
+   - Long jobs (import, shaders, save import/export) run support\totk_setup.py with the bundled Python (support\python).
+   Options: --play (start the game without the window: scripts, benchmarks)  --setup (Settings page)  --tab <0-4>. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -111,7 +112,7 @@ static bool load_settings() {
 static void save_settings() {
     static const char *known[] = { "TOTK_DATA", "TOTK_WINDOW_SIZE", "TOTK_FULLSCREEN", "TOTK_VK_VSYNC_OFF", "TOTK_FPS60", "TOTK_UNCAPPED_HZ",
         "TOTK_RENDER_RES", "TOTK_AUDIO_OFF", "TOTK_VOLUME", "TOTK_LANG", "TOTK_MOUSE", "TOTK_RUMBLE", "TOTK_GYRO", "TOTK_FACE_BUTTONS", "TOTK_VK_DEVICE", "TOTK_XLATE" };
-    S o = "@echo off\r\nrem Settings for \"Tears of the Kingdom " + dispver + "\". Written by the launcher's Settings screen (run the .exe with --setup, or hold Shift);\r\n"
+    S o = "@echo off\r\nrem Settings for \"Tears of the Kingdom " + dispver + "\". Written by the launcher's Settings page;\r\n"
           "rem you may also edit it by hand: lines that start with rem are off, a missing line means the game's default.\r\n";
     for (const char *k : known) { auto it = kv.find(k); if (it != kv.end() && !it->second.empty()) o += S("set \"") + k + "=" + it->second + "\"\r\n"; }
     bool first = true;
@@ -212,7 +213,7 @@ static S launch_game(const WS &logName = L"totk.log") {
     WS exe = here + L"bin\\totk-win.exe";
     if (!exists(exe)) return "bin\\totk-win.exe is missing from\n" + U(here);
     check_data();
-    if (!chk.data) return "The game data for Tears of the Kingdom " + dispver + " was not found:\n" + U(romfs_dir()) + "\\romfs.bin\n\nRun the launcher with --setup (or hold Shift while starting it) and use \"Game files\".";
+    if (!chk.data) return "The game data for Tears of the Kingdom " + dispver + " was not found:\n" + U(romfs_dir()) + "\\romfs.bin\n\nStart \"Tears of the Kingdom.exe\" and run the setup.";
     check_dotnet(); check_vulkan();
     if (!chk.dotnet) {
         if (MessageBoxW(NULL, L"The .NET 10 runtime is not installed. The game needs it to translate shaders.\n\nInstall \".NET Runtime 10\" (x64) from https://dotnet.microsoft.com/download/dotnet/10.0 and start the game again.\n\nOpen the download page now?",
@@ -254,6 +255,7 @@ static std::mutex mu;
 static std::vector<S> logLines;
 static std::atomic<bool> running(false);
 static std::atomic<float> progress(0);
+static float progBase = 0, progSpan = 1;   /* a helper's "@@progress x" fills [progBase, progBase + progSpan] (setup = import + shaders) */
 static S jobStatus, jobError, jobDone, resVersion, resVdir, resData;
 static HANDLE jobProc = NULL;
 static std::atomic<bool> scrollLog(false);
@@ -274,7 +276,7 @@ static int run_helper(const WS &args) {
     CloseHandle(wr); CloseHandle(pi.hThread); jobProc = pi.hProcess;
     S acc; char buf[4096]; DWORD n;
     auto handle = [&](const S &l) {
-        if (l.compare(0, 11, "@@progress ") == 0) progress = (float)atof(l.c_str() + 11);
+        if (l.compare(0, 11, "@@progress ") == 0) progress = progBase + progSpan * (float)atof(l.c_str() + 11);
         else if (l.compare(0, 10, "@@version ") == 0) { size_t sp = l.find(' ', 10); resVdir = l.substr(10, sp - 10); resVersion = l.substr(sp + 1); logline("Detected game version " + resVersion); }
         else if (l.compare(0, 7, "@@data ") == 0) resData = l.substr(7);
         else if (l.compare(0, 8, "@@error ") == 0) { jobError = l.substr(8); logline("ERROR: " + jobError); }
@@ -296,7 +298,7 @@ static int run_helper(const WS &args) {
 static WS q(const S &s) { return L"\"" + W(s) + L"\""; }
 static void start_job(std::function<void()> fn) {
     if (running) return;
-    running = true; progress = 0; jobError.clear(); jobDone.clear(); jobStatus.clear(); resVersion.clear(); resVdir.clear(); resData.clear();
+    running = true; progress = 0; progBase = 0; progSpan = 1; jobError.clear(); jobDone.clear(); jobStatus.clear(); resVersion.clear(); resVdir.clear(); resData.clear();
     std::thread([fn] { fn(); progress = jobError.empty() ? 1.0f : progress.load(); running = false; }).detach();
 }
 
@@ -375,13 +377,16 @@ static WS profile_dir() { return here + L"user-data"; }
 /* "Prepare shaders" (support\prepare_shaders.py through totk_setup.py): the shared shader list translated from the game
    files into <package>\shader-cache before play. Done once per package; resumable. */
 static bool shaders_prepared(const WS &pkg) { return exists(pkg + L"shader-cache\\prepared.json"); }
-static void job_shaders(WS pkg) {
+static void job_shaders(WS pkg, float base = 0) {   /* base: where the progress bar stands (0.6 after an import in the same job) */
     logline("Preparing shaders from your game files (one time; takes a few minutes, uses all CPU cores) ...");
+    jobStatus = "Preparing shaders";
+    progBase = base; progSpan = 1 - base;
     run_helper(L"shaders --pkg " + q(U(pkg)));
 }
 static void job_import(S base, S upd, S keys, S out) {
     WS common = L"--base " + q(base) + (upd.empty() ? L"" : L" --update " + q(upd)) + L" --keys " + q(keys) + L" --output " + q(out);
     logline("Checking the game version ...");
+    progBase = 0; progSpan = 0.6f;   /* import 0-60 %, shaders 60-100 % */
     if (run_helper(L"detect " + common)) return;
     jobStatus = "Version " + resVersion;
     S ver = resVdir, disp = resVersion;
@@ -392,15 +397,16 @@ static void job_import(S base, S upd, S keys, S out) {
         logline("Version " + disp + " belongs to the package \"" + sib->name + "\"; the files go there.");
         target = sib->dir; profileOpen = sib->dir; profileNote = "Imported " + disp + " game files. They belong to the \"" + sib->name + "\" package: open it to play.";
     }
-    progress = 0.12f;
+    progress = progBase + progSpan * 0.12f;
     S okOut = out;
     if (run_helper(L"import " + common)) return;
     if (target == here) { put("TOTK_DATA", okOut); profileNote = "Imported game version " + disp + "."; save_settings(); } else set_data_in(target, okOut);
     check_data();
-    job_shaders(target);
+    job_shaders(target, 0.6f);
 }
 static void job_adopt(S ex, S ro, S out) {
     WS common = L"--exefs " + q(ex) + L" --romfs " + q(ro) + L" --output " + q(out);
+    progBase = 0; progSpan = 0.6f;
     if (run_helper(L"adopt --probe " + common)) return;
     S ver = resVdir, disp = resVersion; WS target = here;
     if (ver != vdir) {
@@ -411,7 +417,7 @@ static void job_adopt(S ex, S ro, S out) {
     if (run_helper(L"adopt " + common)) return;
     if (target == here) { put("TOTK_DATA", resData); save_settings(); profileNote = "Using game version " + disp + "."; } else set_data_in(target, resData);
     check_data();
-    job_shaders(target);
+    job_shaders(target, 0.6f);
 }
 
 /* ---------- widgets ---------- */
@@ -443,6 +449,56 @@ static void job_bar() {
 }
 static bool mod(bool c) { if (c) dirty = true; return c; }
 
+/* Setup is done when the game files are there and the shaders are prepared (both kept on disk), so the one-button setup
+   runs once; it is shown again only when the game files are deleted or "Run setup again" is chosen (Game files). */
+static bool setupMode = false;
+static bool setup_done() { return chk.data && shaders_prepared(here); }
+static void big_button_colors() { ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.30f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.65f, 0.36f, 1)); }
+static void page_setup() {
+    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts.back());
+    ImGui::Text("Set up Tears of the Kingdom");
+    ImGui::PopFont();
+    ImGui::TextDisabled("Native Windows port - game version %s. One time: about 20 GB of disk and 10-20 minutes.", dispver.c_str());
+    ImGui::Spacing();
+    bool haveData = chk.data;
+    if (running) ImGui::BeginDisabled();
+    if (haveData) {
+        status_line(true, chk.dataMsg + "\n" + U(data_dir()));
+        ImGui::TextWrapped("The game files are in place. What is left: preparing the shaders from them (it continues where it stopped).");
+    } else {
+        ImGui::TextWrapped("Pick your own dump of the game: the base game (1.0.0, .nsp or .xci), the update NSP for 1.1.1 / 1.2.0 / 1.4.3 if this package is one of those, and your prod.keys. Setup imports and verifies the files, then prepares the shaders.");
+        ImGui::Spacing();
+        path_row("Base game (.nsp / .xci)", baseP, sizeof baseP, false, L"Switch game", L"*.nsp;*.xci");
+        path_row("Update (optional .nsp)", updP, sizeof updP, false, L"Update NSP", L"*.nsp");
+        path_row("prod.keys", keysP, sizeof keysP, false, L"prod.keys", L"*.keys");
+        path_row("Store the game data in", outP, sizeof outP, true);
+    }
+    if (running) ImGui::EndDisabled();
+    ImGui::Spacing(); ImGui::Spacing();
+    bool ready = !running && (haveData || (baseP[0] && keysP[0] && outP[0]));
+    if (!ready) ImGui::BeginDisabled();
+    big_button_colors();
+    const char *label = running ? "Setting up..." : haveData ? "Continue setup" : "Set up";
+    if (ImGui::Button(label, ImVec2(ImGui::GetFontSize() * 12, ImGui::GetFontSize() * 2.6f))) {
+        { std::lock_guard<std::mutex> l(mu); logLines.clear(); } profileNote.clear(); profileOpen.clear();
+        if (haveData) start_job([] { job_shaders(here); });
+        else { S b = baseP, u = updP, k = keysP, o = outP; start_job([=] { job_import(b, u, k, o); }); }
+    }
+    ImGui::PopStyleColor(2);
+    if (!ready) ImGui::EndDisabled();
+    if (running) { ImGui::SameLine(); if (ImGui::Button("Stop") && jobProc) { TerminateProcess(jobProc, 1); logline("Stopped. Setup continues from here next time."); } }
+    ImGui::Spacing();
+    job_bar();
+    if (!profileNote.empty()) { ImGui::TextWrapped("%s", profileNote.c_str()); if (!profileOpen.empty() && !running && ImGui::Button("Open that package")) { WS exe = profileOpen + L"Tears of the Kingdom.exe"; ShellExecuteW(NULL, L"open", exe.c_str(), NULL, profileOpen.c_str(), SW_SHOWNORMAL); PostQuitMessage(0); } }
+    if (!running && setup_done()) {
+        ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1), "Setup is complete.");
+        big_button_colors();
+        if (ImGui::Button("Continue", ImVec2(ImGui::GetFontSize() * 8, 0))) { setupMode = false; tab = 0; }
+        ImGui::PopStyleColor(2);
+    }
+    ImGui::Spacing();
+    if (ImGui::CollapsingHeader("Details")) log_panel(ImGui::GetFontSize() * 12);
+}
 static void page_play() {
     ImGui::PushFont(ImGui::GetIO().Fonts->Fonts.back());
     ImGui::Text("Tears of the Kingdom");
@@ -450,34 +506,66 @@ static void page_play() {
     ImGui::TextDisabled("Native Windows port - game version %s", dispver.c_str());
     ImGui::Spacing();
     if (!banner.empty()) { ImGui::PushStyleColor(ImGuiCol_Text, bannerErr ? ImVec4(0.95f, 0.5f, 0.4f, 1) : ImVec4(0.8f, 0.8f, 0.8f, 1)); ImGui::TextWrapped("%s", banner.c_str()); ImGui::PopStyleColor(); ImGui::Spacing(); }
-    status_line(chk.data, chk.dataMsg);
-    status_line(chk.vulkan, chk.vulkanMsg);
-    status_line(chk.dotnet, chk.dotnetMsg);
-    if (chk.data) {
-        bool prep = shaders_prepared(here);
-        status_line(prep, prep ? "Shaders prepared" : "Shaders not prepared yet: without them effects are missing and the game stutters the first time they appear");
-        if (!prep || running) { ImGui::SameLine(); if (running) ImGui::BeginDisabled(); if (ImGui::Button("Prepare shaders")) start_job([] { job_shaders(here); }); if (running) ImGui::EndDisabled(); }
-        if (running) job_bar();
-    }
-    if (!profileNote.empty()) { ImGui::Spacing(); ImGui::TextWrapped("%s", profileNote.c_str()); if (!profileOpen.empty() && ImGui::Button("Open that package")) { WS exe = profileOpen + L"Tears of the Kingdom.exe"; ShellExecuteW(NULL, L"open", exe.c_str(), L"--setup", profileOpen.c_str(), SW_SHOWNORMAL); PostQuitMessage(0); } }
-    ImGui::Spacing(); ImGui::Spacing();
     bool can = chk.data && chk.vulkan && chk.dotnet && !running;
+    ImGui::Spacing();
     if (!can) ImGui::BeginDisabled();
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.55f, 0.30f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.22f, 0.65f, 0.36f, 1));
-    if (ImGui::Button("  Play  ", ImVec2(ImGui::GetFontSize() * 9, ImGui::GetFontSize() * 2.6f))) wantPlay = true;
+    big_button_colors();
+    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts.back());
+    if (ImGui::Button("PLAY", ImVec2(ImGui::GetContentRegionAvail().x, ImGui::GetFontSize() * 2.4f))) wantPlay = true;
+    ImGui::PopFont();
     ImGui::PopStyleColor(2);
     if (!can) ImGui::EndDisabled();
-    if (!chk.data) { ImGui::SameLine(); if (ImGui::Button("Add game files...")) tab = 1; }
-    ImGui::Spacing();
+    ImGui::Spacing(); ImGui::Spacing();
     bool fs = get("TOTK_FULLSCREEN") == "1";
     if (ImGui::Checkbox("Start in fullscreen##f", &fs)) { put("TOTK_FULLSCREEN", fs ? "1" : ""); dirty = true; }
-    ImGui::TextDisabled("In game: F11 or Alt+Enter toggles fullscreen. To reach this screen again, start the launcher with --setup or hold Shift.");
+    ImGui::Spacing();
+    bool prep = shaders_prepared(here);
+    if (!chk.vulkan || !chk.dotnet || !chk.data || !prep) {
+        status_line(chk.data, chk.dataMsg);
+        status_line(chk.vulkan, chk.vulkanMsg);
+        status_line(chk.dotnet, chk.dotnetMsg);
+        status_line(prep, prep ? "Shaders prepared" : "Shaders not prepared: Game files > Run setup again");
+    } else if (ImGui::CollapsingHeader("System check")) {
+        status_line(chk.data, chk.dataMsg); status_line(chk.vulkan, chk.vulkanMsg); status_line(chk.dotnet, chk.dotnetMsg); status_line(prep, "Shaders prepared");
+    }
+    ImGui::TextDisabled("In game: F11 or Alt+Enter toggles fullscreen.");
+}
+
+/* Deletes this package's extracted game files (<data>\extracted\<ver>) and the "prepared" mark, so setup runs again. */
+static S delete_game_files() {
+    WS dir = data_dir() + L"\\extracted\\" + W(vdir);
+    if (!exists(dir + L"\\romfs\\romfs.bin")) return "No game files to delete in " + U(dir);
+    WS from = dir; from.push_back(L'\0');
+    SHFILEOPSTRUCTW op = {}; op.wFunc = FO_DELETE; op.pFrom = from.c_str(); op.fFlags = FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    int rc = SHFileOperationW(&op);
+    DeleteFileW((here + L"shader-cache\\prepared.json").c_str());
+    check_data();
+    return rc || op.fAnyOperationsAborted ? fmt("Deleting %s failed (error %d).", U(dir).c_str(), rc) : S();
 }
 
 static void page_files() {
     ImGui::Text("Game files"); ImGui::Separator();
     check_data();
     status_line(chk.data, chk.dataMsg + (chk.data ? "\n" + U(data_dir()) : ""));
+    status_line(shaders_prepared(here), shaders_prepared(here) ? "Shaders prepared" : "Shaders not prepared");
+    if (running) ImGui::BeginDisabled();
+    if (ImGui::Button("Run setup again")) { setupMode = true; }
+    if (chk.data) {
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.55f, 0.20f, 0.18f, 1)); ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.68f, 0.25f, 0.22f, 1));
+        if (ImGui::Button("Delete game files...")) ImGui::OpenPopup("Delete game files?");
+        ImGui::PopStyleColor(2);
+    }
+    if (running) ImGui::EndDisabled();
+    if (ImGui::BeginPopupModal("Delete game files?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextWrapped("This deletes the extracted game files of %s (about 17 GB):", dispver.c_str());
+        ImGui::TextColored(ImVec4(0.6f, 0.8f, 1, 1), "%s\\extracted\\%s", U(data_dir()).c_str(), vdir.c_str());
+        ImGui::TextWrapped("Your saves, settings and your NSP / keys are not touched. Setup has to run again before you can play.");
+        if (ImGui::Button("Delete")) { S e = delete_game_files(); banner = e.empty() ? "Game files deleted." : e; bannerErr = !e.empty(); if (e.empty()) setupMode = true; ImGui::CloseCurrentPopup(); }
+        ImGui::SameLine(); if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+    if (!banner.empty() && !setupMode) ImGui::TextWrapped("%s", banner.c_str());
     ImGui::Spacing();
     bool busy = running;
     if (busy) ImGui::BeginDisabled();
@@ -632,7 +720,7 @@ static void page_controls() {
     ImGui::SeparatorText("Mouse");
     ImGui::TextWrapped("Optional (Settings > Input): the mouse moves the right stick; left / right / middle button = ZR / ZL / R3.");
     ImGui::SeparatorText("More");
-    ImGui::TextWrapped("The button layout can be remapped with controls.txt (see README-windows.md). Run this launcher with --setup, or hold Shift while starting it, to come back here.");
+    ImGui::TextWrapped("The button layout can be remapped with controls.txt (see README-windows.md). This window opens every time you start \"Tears of the Kingdom.exe\".");
     if (ImGui::Button("Open package folder")) open_path(here);
 }
 
@@ -671,7 +759,7 @@ static void gui(int startTab) {
     int ww = (int)(1000 * scale), wh = (int)(660 * scale);
     RECT r = { 0, 0, ww, wh }; AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     int sx = GetSystemMetrics(SM_CXSCREEN), sy = GetSystemMetrics(SM_CYSCREEN);
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"Tears of the Kingdom - Setup", WS_OVERLAPPEDWINDOW, (sx - (r.right - r.left)) / 2, (sy - (r.bottom - r.top)) / 2, r.right - r.left, r.bottom - r.top, NULL, NULL, hi, NULL);
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"Tears of the Kingdom", WS_OVERLAPPEDWINDOW, (sx - (r.right - r.left)) / 2, (sy - (r.bottom - r.top)) / 2, r.right - r.left, r.bottom - r.top, NULL, NULL, hi, NULL);
     DXGI_SWAP_CHAIN_DESC sd = {}; sd.BufferCount = 2; sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; sd.OutputWindow = hwnd; sd.SampleDesc.Count = 1; sd.Windowed = TRUE; sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
     D3D_FEATURE_LEVEL fl; const D3D_FEATURE_LEVEL lv[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
     HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, lv, 2, D3D11_SDK_VERSION, &sd, &sc, &dev, &fl, &ctx);
@@ -695,6 +783,18 @@ static void gui(int startTab) {
         ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(io.DisplaySize);
         ImGui::Begin("main", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        if (setupMode) {   /* first run (or "Run setup again"): one screen, no tabs */
+            ImGui::BeginChild("setup", ImVec2(0, 0), false, ImGuiWindowFlags_AlwaysUseWindowPadding);
+            page_setup();
+            ImGui::EndChild();
+            ImGui::End(); ImGui::Render();
+            const float clear0[4] = { 0.09f, 0.095f, 0.11f, 1 };
+            ctx->OMSetRenderTargets(1, &rtv, NULL); ctx->ClearRenderTargetView(rtv, clear0);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+            sc->Present(1, 0);
+            if (dirty) { dirty = false; save_settings(); }
+            continue;
+        }
         float sw = 170 * scale;
         ImGui::BeginChild("side", ImVec2(sw, 0), false);
         ImGui::Dummy(ImVec2(0, 6 * scale));
@@ -737,13 +837,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     if (!read_text(here + L"bin\\game-version.txt", gv) || sscanf(gv.c_str(), "%63s %63s", a, b) != 2) { fail("bin\\game-version.txt is missing or damaged in\n" + U(here) + "\n\nThe package looks incomplete; rebuild it with build_windows.py."); return 1; }
     dispver = a; vdir = b;
     int argc; LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    bool setup = false, play = false; int startTab = -1;
-    for (int i = 1; i < argc; i++) { if (!wcscmp(argv[i], L"--setup")) setup = true; else if (!wcscmp(argv[i], L"--play")) play = true; else if (!wcscmp(argv[i], L"--tab") && i + 1 < argc) { startTab = _wtoi(argv[++i]); setup = true; } }
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) setup = true;
+    /* The launcher window always opens (setup on the first run, then Play / Game files / Settings / Saves / Controls).
+       --play starts the game without it (scripts, benchmarks); --setup opens the Settings page; --tab <0-4> a page. */
+    bool play = false; int startTab = -1;
+    for (int i = 1; i < argc; i++) { if (!wcscmp(argv[i], L"--setup")) startTab = 2; else if (!wcscmp(argv[i], L"--play")) play = true; else if (!wcscmp(argv[i], L"--tab") && i + 1 < argc) startTab = _wtoi(argv[++i]); }
     if (!load_settings()) { fail("settings.bat was not found next to the launcher:\n" + U(here + L"settings.bat")); return 1; }
     check_data();
-    if (!chk.data && !play) setup = true;
-    if (!setup) {
+    if (play) {
         S err = launch_game();
         if (!err.empty() && err != "!") fail(err);
         return err.empty() ? 0 : 1;
@@ -752,6 +852,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
     scan_siblings(); check_vulkan(); check_dotnet(); check_python();
     guess_keys(); setbuf(outP, sizeof outP, U(here) + "data");
     if (!chk.data && get("TOTK_DATA").find("%~dp0") == S::npos && !get("TOTK_DATA").empty()) setbuf(outP, sizeof outP, expand(get("TOTK_DATA")));
-    gui(startTab >= 0 ? startTab : chk.data ? 0 : 1);
+    setupMode = !setup_done() && startTab < 0;
+    gui(startTab >= 0 ? startTab : 0);
     return 0;
 }
