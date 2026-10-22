@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+#include <windows.h>
 
 extern "C" {
 #include "win/settings_ini.h"
@@ -34,6 +36,11 @@ void gamepad_sdl_set_trigger_threshold(int pct);
 void gamepad_sdl_set_mouse(int on, float sens);
 void gamepad_feedback_set_gain(float g);
 int runtime_hid_feedback_flag(const char *name, int v);
+int prof_win_start(double delay_s, double dur_s, const char *out) __attribute__((weak));
+void vk_pipe_stats(uint64_t *made, uint64_t *ns, int *pending) __attribute__((weak));
+void vk_rt_stats(uint64_t *translated, uint64_t *hits, uint64_t *misses) __attribute__((weak));
+uint64_t mtl_present_count(void) __attribute__((weak));
+extern _Atomic uint64_t g_stat_skip_shader, g_stat_skip_pipe;
 }
 
 namespace {
@@ -148,6 +155,7 @@ extern "C" int overlay_event(const SDL_Event *e) {
     }
 }
 
+static void apply_menu_scale();
 static bool init_imgui(const overlay_vk_frame *f) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -173,12 +181,16 @@ static bool init_imgui(const overlay_vk_frame *f) {
     ii.PipelineRenderingCreateInfo = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
     ii.PipelineRenderingCreateInfo.colorAttachmentCount = 1; ii.PipelineRenderingCreateInfo.pColorAttachmentFormats = &g_fmt;
     if (!ImGui_ImplVulkan_Init(&ii)) return false;
+    apply_menu_scale();
     fprintf(stderr, "[totk-menu] ready (F1 / Esc, or Minus + Plus on a controller)\n");
     return true;
 }
 
+static int g_fpsPos = -1;   /* 0 top left, 1 top right, 2 bottom left, 3 bottom right (TOTK_FPS_POS) */
 static void fps_window() {
-    ImGui::SetNextWindowPos(ImVec2(12, 12));
+    if (g_fpsPos < 0) { const char *e = getenv("TOTK_FPS_POS"); g_fpsPos = e ? atoi(e) & 3 : 0; }
+    ImVec2 ds = ImGui::GetIO().DisplaySize;
+    ImGui::SetNextWindowPos(ImVec2(g_fpsPos & 1 ? ds.x - 12 : 12, g_fpsPos & 2 ? ds.y - 12 : 12), ImGuiCond_Always, ImVec2(g_fpsPos & 1 ? 1.0f : 0.0f, g_fpsPos & 2 ? 1.0f : 0.0f));
     ImGui::SetNextWindowBgAlpha(0.45f);
     ImGui::Begin("##fps", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoInputs |
                  ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings);
@@ -228,6 +240,31 @@ static int device_index() {   /* 0 = default, i + 1 = g_devIds[i]; -1 = a saved 
     if (cur.empty()) return 0;
     for (int i = 0; i < g_ndev; i++) if (cur == g_devIds[i]) return i + 1;
     return -1;
+}
+
+static int env_int(const char *k, int def) { const char *v = getenv(k); return v && *v ? atoi(v) : def; }
+static void apply_menu_scale() { ImGui::GetIO().FontGlobalScale = env_int("TOTK_MENU_SCALE", 100) / 100.0f; }
+static std::string g_advNote;   /* result line of the last Advanced action */
+static void save_diagnostics() {
+    char dir[MAX_PATH]; time_t t = time(NULL); struct tm lt; localtime_s(&lt, &t);
+    snprintf(dir, sizeof dir, "logs\\diagnostics-%04d%02d%02d-%02d%02d%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday, lt.tm_hour, lt.tm_min, lt.tm_sec);
+    CreateDirectoryA("logs", NULL); CreateDirectoryA(dir, NULL);
+    char p[MAX_PATH + 32];
+    snprintf(p, sizeof p, "%s\\totk.log", dir); CopyFileA("logs\\totk.log", p, FALSE);
+    const char *ini = settings_ini_path(); snprintf(p, sizeof p, "%s\\settings.ini", dir); if (ini) CopyFileA(ini, p, FALSE);
+    snprintf(p, sizeof p, "%s\\stats.txt", dir);
+    FILE *f = fopen(p, "w");
+    if (f) {
+        uint64_t made = 0, ns = 0, tr = 0, hits = 0, miss = 0; int pend = 0;
+        if (vk_pipe_stats) vk_pipe_stats(&made, &ns, &pend);
+        if (vk_rt_stats) vk_rt_stats(&tr, &hits, &miss);
+        fprintf(f, "fps %.1f frame_ms %.2f presents %llu\npipelines %llu (%.2f ms average) pending %d\ndraws skipped: shader %llu pipeline %llu\nshaders: %llu found in the cache, %llu missing, %llu translated during play\n",
+                g_fps, g_ms, (unsigned long long)(mtl_present_count ? mtl_present_count() : 0), (unsigned long long)made, made ? ns / 1e6 / made : 0.0, pend,
+                (unsigned long long)g_stat_skip_shader, (unsigned long long)g_stat_skip_pipe, (unsigned long long)hits, (unsigned long long)miss, (unsigned long long)tr);
+        fclose(f);
+    }
+    g_advNote = std::string("Saved to ") + dir;
+    fprintf(stderr, "[totk-menu] diagnostics saved to %s\n", dir);
 }
 
 static std::vector<Row> tab_rows(int tab) {
@@ -308,6 +345,34 @@ static std::vector<Row> tab_rows(int tab) {
         Row fb; fb.label = "Face buttons"; fb.next_start = true; { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); fb.value = faces[i < 0 ? 0 : i].label; }
         fb.change = [](int d) { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); i = ((i < 0 ? 0 : i) + d + 3) % 3; settings_ini_set("TOTK_FACE_BUTTONS", faces[i].value[0] ? faces[i].value : nullptr); };
         r.push_back(fb);
+    } else if (tab == 4) {   /* Interface */
+        static const int scales[] = {80, 90, 100, 115, 130, 150};
+        Row sc; sc.label = "Menu size"; { char b[16]; snprintf(b, sizeof b, "%d %%", env_int("TOTK_MENU_SCALE", 100)); sc.value = b; }
+        sc.change = [](int d) { int cur = env_int("TOTK_MENU_SCALE", 100), i = 2; for (int k = 0; k < 6; k++) if (scales[k] == cur) i = k; i = (i + d + 6) % 6;
+                                char b[8]; snprintf(b, sizeof b, "%d", scales[i]); settings_ini_set("TOTK_MENU_SCALE", scales[i] == 100 ? nullptr : b); apply_menu_scale(); };
+        r.push_back(sc);
+        static const char *corners[] = {"Top left", "Top right", "Bottom left", "Bottom right"};
+        Row fp; fp.label = "FPS counter position"; fp.value = corners[g_fpsPos < 0 ? 0 : g_fpsPos];
+        fp.change = [](int d) { g_fpsPos = ((g_fpsPos < 0 ? 0 : g_fpsPos) + d + 4) % 4; char b[4]; snprintf(b, sizeof b, "%d", g_fpsPos); settings_ini_set("TOTK_FPS_POS", g_fpsPos ? b : nullptr); };
+        r.push_back(fp);
+        static const int dims[] = {0, 25, 55, 75};
+        Row dm; dm.label = "Background dim"; { char b[16]; snprintf(b, sizeof b, "%d %%", env_int("TOTK_MENU_DIM", 55)); dm.value = b; }
+        dm.change = [](int d) { int cur = env_int("TOTK_MENU_DIM", 55), i = 2; for (int k = 0; k < 4; k++) if (dims[k] == cur) i = k; i = (i + d + 4) % 4;
+                                char b[8]; snprintf(b, sizeof b, "%d", dims[i]); settings_ini_set("TOTK_MENU_DIM", dims[i] == 55 ? nullptr : b); };
+        r.push_back(dm);
+        Row ad; ad.label = "Advanced tab"; ad.value = env_int("TOTK_MENU_ADVANCED", 0) ? "Shown" : "Hidden";
+        ad.change = [](int) { settings_ini_set("TOTK_MENU_ADVANCED", env_int("TOTK_MENU_ADVANCED", 0) ? nullptr : "1"); };
+        r.push_back(ad);
+    } else if (tab == 5) {   /* Advanced */
+        Row pr; pr.label = "Profile CPU for 20 s"; pr.activate = [] {
+            char p[MAX_PATH]; time_t t = time(NULL); struct tm lt; localtime_s(&lt, &t);
+            CreateDirectoryA("logs", NULL);
+            snprintf(p, sizeof p, "logs\\totk-prof-%02d%02d%02d.txt", lt.tm_hour, lt.tm_min, lt.tm_sec);
+            g_advNote = prof_win_start && prof_win_start(0, 20, p) ? std::string("Profiling 20 s (close the menu to profile play) -> ") + p : "A profile already ran in this session";
+        };
+        r.push_back(pr);
+        Row dg; dg.label = "Save diagnostics"; dg.activate = [] { save_diagnostics(); };
+        r.push_back(dg);
     }
     return r;
 }
@@ -319,8 +384,8 @@ enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_TAB_PREV, NAV_TAB_NEXT
 static std::vector<int> g_nav;
 static int g_sel, g_tab;
 static bool g_mouseMoved; static ImVec2 g_mouseAtOpen(-1, -1);
-static const char *kTabs[] = {"Game", "Video", "Audio", "Controls"};
-static const int kNumTabs = 4;
+static const char *kTabs[] = {"Game", "Video", "Audio", "Controls", "Interface", "Advanced"};
+#define kNumTabs (env_int("TOTK_MENU_ADVANCED", 0) ? 6 : 5)
 static bool nav_key(const SDL_Event &e) {   /* render thread: true if the key is ours */
     if (e.type != SDL_EVENT_KEY_DOWN && e.type != SDL_EVENT_KEY_UP) return false;
     int a = -1;
@@ -374,9 +439,10 @@ static void menu_window() {
         }
     }
     g_nav.clear();
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
+    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, env_int("TOTK_MENU_DIM", 55) * 255 / 100));
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.y * 0.75f, 0));
+    if (g_tab >= kNumTabs) g_tab = 0;
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.y * 0.85f * io.FontGlobalScale, 0));
     ImGui::Begin("Tears of the Kingdom", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
     float w = ImGui::GetContentRegionAvail().x;
@@ -409,6 +475,17 @@ static void menu_window() {
         else snprintf(label, sizeof label, "%s", r.label.c_str());
         if (row_button(label, i + 1, w)) { if (r.change) r.change(+1); else if (r.activate) r.activate(); }
         anyNext |= r.next_start;
+    }
+    if (g_tab == 5) {
+        uint64_t made = 0, ns = 0, tr = 0, hits = 0, miss = 0; int pend = 0;
+        if (vk_pipe_stats) vk_pipe_stats(&made, &ns, &pend);
+        if (vk_rt_stats) vk_rt_stats(&tr, &hits, &miss);
+        ImGui::SeparatorText("Statistics");
+        ImGui::Text("%.1f FPS, %.1f ms per frame, %llu frames shown", g_fps, g_ms, (unsigned long long)(mtl_present_count ? mtl_present_count() : 0));
+        ImGui::Text("Pipelines: %llu made (%.2f ms average), %d being made", (unsigned long long)made, made ? ns / 1e6 / made : 0.0, pend);
+        ImGui::Text("Shaders: %llu from the prepared cache, %llu missing, %llu translated while playing", (unsigned long long)hits, (unsigned long long)miss, (unsigned long long)tr);
+        ImGui::Text("Draws skipped (not ready): shader %llu, pipeline %llu", (unsigned long long)g_stat_skip_shader, (unsigned long long)g_stat_skip_pipe);
+        if (!g_advNote.empty()) ImGui::TextWrapped("%s", g_advNote.c_str());
     }
     ImGui::Spacing();
     if (anyNext) ImGui::TextDisabled("* applies the next time the game starts");

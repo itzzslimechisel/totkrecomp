@@ -31,6 +31,7 @@ static char g_dir[1024];
 static HANDLE g_in_w, g_out_r; static int g_svc = -1;
 #endif
 static uint64_t g_translated, g_hits, g_misses;
+void vk_rt_stats(uint64_t *translated, uint64_t *hits, uint64_t *misses) { *translated = g_translated; *hits = g_hits; *misses = g_misses; }   /* in-game menu */
 
 static const char *cache_dir(void) {
     if (g_dir[0]) return g_dir;

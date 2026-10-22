@@ -168,17 +168,26 @@ static DWORD WINAPI prof_main(LPVOID arg) {
     return 0;
 }
 
-__attribute__((constructor)) static void prof_start(void) {
-    const char *e = getenv("TOTK_PROF");
-    if (!e || !*e) return;
-    char buf[MAX_PATH + 64]; snprintf(buf, sizeof buf, "%s", e);
-    char *p = buf, *q;
-    g_start_s = strtod(p, &q); if (*q == ',') { p = q + 1; g_dur_s = strtod(p, &q); if (*q == ',') snprintf(g_out, sizeof g_out, "%s", q + 1); }
-    if (g_dur_s <= 0) g_dur_s = 20;
+/* Starts one sampling run (after delay_s, for dur_s, written to out); 0 if one already ran or memory is short. Used by
+   TOTK_PROF at start and by the in-game menu's Advanced tab. */
+int prof_win_start(double delay_s, double dur_s, const char *out) {
+    static LONG started;
+    if (InterlockedExchange(&started, 1)) return 0;
+    g_start_s = delay_s > 0 ? delay_s : 0; g_dur_s = dur_s > 0 ? dur_s : 20;
+    if (out && *out) snprintf(g_out, sizeof g_out, "%s", out);
     g_slots = calloc(PROF_HASH, sizeof *g_slots); g_stacks = calloc(PROF_STACKS, sizeof *g_stacks);
-    if (!g_slots || !g_stacks) return;
+    if (!g_slots || !g_stacks) return 0;
     { HMODULE m = GetModuleHandleA(NULL); const IMAGE_DOS_HEADER *d = (const void *)m; const IMAGE_NT_HEADERS *nt = (const void *)((const char *)m + d->e_lfanew);
       g_exe_lo = (DWORD64)(uintptr_t)m; g_exe_hi = g_exe_lo + nt->OptionalHeader.SizeOfImage; }
     HANDLE h = CreateThread(NULL, 0, prof_main, NULL, 0, NULL);
     if (h) CloseHandle(h);
+    return h != NULL;
+}
+__attribute__((constructor)) static void prof_start(void) {
+    const char *e = getenv("TOTK_PROF");
+    if (!e || !*e) return;
+    char buf[MAX_PATH + 64]; snprintf(buf, sizeof buf, "%s", e);
+    char *p = buf, *q; double start, dur = 20; char out[MAX_PATH] = "";
+    start = strtod(p, &q); if (*q == ',') { p = q + 1; dur = strtod(p, &q); if (*q == ',') snprintf(out, sizeof out, "%s", q + 1); }
+    prof_win_start(start, dur, out);
 }
