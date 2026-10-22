@@ -308,6 +308,15 @@ Dynarmic::A64::UserConfig make_config(cpu_context *ctx, Callbacks *cb, bool nest
         if (g_backend->cfg.fp_accuracy >= 2)
             uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP | Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
     }
+    // Exclusive loads / stores without the global monitor (the store becomes a host compare-and-swap against the loaded
+    // value; an ABA change between them goes unseen, as in other emulators' fast modes). On by default except with
+    // TOTK_JIT_ACCURACY=accurate: the game's job system issues thousands of them per second, and the global monitor's
+    // lock made gameplay ~38 FPS against ~61 without it (1.0.0 prologue, RTX 3070 / 2026-10-23; a 4 min run without
+    // errors). TOTK_JIT_GLOBAL_MONITOR=1 keeps the monitor. TOTK_JIT_REDUCED_FP=1 adds the approximate FRECPE / FRSQRTE of
+    // "fast" on its own (no measurable gain).
+    { const char *e = getenv("TOTK_JIT_GLOBAL_MONITOR");
+      if (g_backend->cfg.fp_accuracy >= 1 && !(e && !strcmp(e, "1"))) { uc.unsafe_optimizations = true; uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor; } }
+    { const char *e = getenv("TOTK_JIT_REDUCED_FP"); if (e && !strcmp(e, "1")) { uc.unsafe_optimizations = true; uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP; } }
     // Reserved, committed on demand (dynarmic BlockOfCode). A full cache is flushed and everything recompiled: with 128 MiB
     // the game's main thread spent ~40 % of its time recompiling during gameplay (TOTK_PROF, 1.4.3).
     uc.code_cache_size = nested ? 64u * 1024 * 1024 : 512u * 1024 * 1024;

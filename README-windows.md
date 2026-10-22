@@ -59,5 +59,5 @@ Keyboard: the same layout as the Mac build (`keymap_sdl.h`, remappable through `
 
 - Works (verified on the author's PC): import of both NSPs, boot, the prologue rendering in the window at 1920x1080 through Vulkan, sound through WASAPI (4 start-up underruns, none after), window events.
 - Untested by hand: keyboard and gamepad input in game (the code is wired and the controller / keyboard devices initialize, but nobody has played with them), rumble, motion, fullscreen toggling, window resize, text entry, saving, long play sessions, other GPUs (tested on one NVIDIA card only).
-- Performance is not good yet: about 35 FPS in the prologue on an RTX 3070 (CPU-bound in the JIT, not the GPU). No picture-side FPS overlay on Windows.
+- Performance: about 60 FPS in the prologue cave on an RTX 3070 (1.0.0, prepared shaders). The JIT runs exclusive loads / stores without dynarmic's global monitor by default (`TOTK_JIT_GLOBAL_MONITOR=1` restores it, about 38 FPS); the FPS counter is in the in-game menu (F1).
 - 1.1.1 and 1.2.0 (Windows only) have no cloth/hair real-time clock patch (cloth follows the game clock at frame rates other than 30). The tests and the CMake build for ARM64 Windows are experimental.
