@@ -625,7 +625,8 @@ static void page_controls() {
     ImGui::SeparatorText("Keyboard (Mac layout, by key position)");
     ImGui::BulletText("W A S D: left stick       Arrow keys: right stick");
     ImGui::BulletText("J: A   K or Space: B   I: X   U: Y   Z / C: stick clicks   Q: L   E: R");
-    ImGui::BulletText("Left Alt: ZL   Left Shift: ZR   Enter: +   Tab or Esc: -   F / T / H / G: D-pad");
+    ImGui::BulletText("Left Alt: ZL   Left Shift: ZR   Enter: +   Tab: -   F / T / H / G: D-pad");
+    ImGui::BulletText("In-game menu: F1 or Esc (controller: Minus + Plus together)");
     ImGui::BulletText("1-5: shortcut keys   F11 or Alt+Enter: fullscreen");
     ImGui::SeparatorText("Controllers");
     ImGui::TextWrapped("Any SDL3-supported gamepad works (Xbox / XInput, DualSense, DualShock 4, Switch Pro): plug it in or pair it before or during the game. Rumble and motion can be turned off in Settings. Face-button mapping can follow the labels or the Nintendo positions.");

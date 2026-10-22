@@ -3,6 +3,7 @@
 // (event values, counter records, read-back pool bytes) happens only after the GPU completed that submission; CPU waits
 // look only at the retired fence g_done, which the completion thread advances after applying those effects.
 #include "nvn_vk.h"
+#include "overlay.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -485,6 +486,8 @@ void vk_oneoff_end(VkCommandBuffer cb) {   // ordered after all earlier submissi
 }
 
 // ---------- present ----------
+static uint64_t g_swap_gen;   /* bumped when the swapchain is recreated (the overlay remakes its image views) */
+int overlay_vk_draw(const overlay_vk_frame *f) __attribute__((weak));
 static int swap_create(void) {
     if (!V.surface_fn) return 0;
     if (!V.surface) { V.surface = (VkSurfaceKHR)(uintptr_t)V.surface_fn(V.inst); if (!V.surface) return 0; }
@@ -508,6 +511,7 @@ static int swap_create(void) {
     if (vkCreateSwapchainKHR(V.dev, &ci, NULL, &V.swap) != VK_SUCCESS) { V.swap = VK_NULL_HANDLE; return 0; }
     if (old) { vkDeviceWaitIdle(V.dev); vkDestroySwapchainKHR(V.dev, old, NULL); }
     V.sfmt = pick.format; V.sext = caps.currentExtent;
+    g_swap_gen++;
     V.nsimg = 8; vkGetSwapchainImagesKHR(V.dev, V.swap, &V.nsimg, V.simg);
     VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (uint32_t i = 0; i < 8; i++) { if (!V.s_acq[i]) vkCreateSemaphore(V.dev, &sci, NULL, &V.s_acq[i]); if (!V.s_done[i]) vkCreateSemaphore(V.dev, &sci, NULL, &V.s_done[i]); }
@@ -648,6 +652,10 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkDependencyInfo d2 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb};
     vkCmdPipelineBarrier2(cb, &d2);
     vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+    if (overlay_vk_draw) {   /* the in-game menu / FPS counter (runtime/overlay), drawn last; the image is TRANSFER_DST again after it */
+        overlay_vk_frame of = {V.inst, V.phys, V.dev, V.q, &V.qmu, V.qfam, V.nsimg, idx, cb, V.simg[idx], (uint32_t)V.sfmt, V.sext.width, V.sext.height, g_swap_gen};
+        overlay_vk_draw(&of);
+    }
     VkImageMemoryBarrier2 pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0, V.simg[idx], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkDependencyInfo d3 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &pb};

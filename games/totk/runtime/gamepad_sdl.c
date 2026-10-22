@@ -182,7 +182,13 @@ void runtime_touch_pad_set(const RuntimeGamepadState *s) {   /* on-screen contro
     SDL_UnlockSpinlock(&stateLock);
 }
 
+int overlay_open(void) __attribute__((weak));   /* runtime/overlay: the game reads nothing while the menu is open */
 void runtime_gamepad_read(RuntimeGamepadState *out) {
+    if (overlay_open && overlay_open()) {
+        SDL_LockSpinlock(&stateLock); int c = gamepadState.connected || touchState.connected; pressedEdges = 0; SDL_UnlockSpinlock(&stateLock);
+        *out = (RuntimeGamepadState){0}; out->connected = c;
+        return;
+    }
     SDL_LockSpinlock(&stateLock);
     *out = gamepadState;
     out->buttons |= touchState.buttons | pressedEdges;

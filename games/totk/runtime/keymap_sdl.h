@@ -2,7 +2,7 @@
    scancodes, which are USB HID keyboard usage ids (SDL_SCANCODE_A = 4 ...), and passes runtime_input_key the code the
    Mac's NSEvent.keyCode (kVK_*) gives for the key in the same place, so the layout is the Mac one by position
    (input.c button(): J A, K / Space B, I X, U Y, Z / C stick clicks, Q L, E R, Left Alt ZL (Mac Option), Left Shift ZR,
-   Return Plus, Tab / Esc Minus, F T H G D-pad, W A S D left stick, arrows right stick; 1-5 the shortcut keys).
+   Return Plus, Tab Minus (Esc opens the in-game menu, runtime/overlay), F T H G D-pad, W A S D left stick, arrows right stick; 1-5 the shortcut keys).
    Pure C without SDL headers: tests/input_win/test_keymap.c covers it. 0xFF = no Mac key (ignored). */
 #pragma once
 #include <stdint.h>

@@ -41,6 +41,7 @@ target_include_directories(totk_gfx_vk PUBLIC
   ${GFX_DIR}/nvn ${GFX_DIR}/nvn/include ${GFX_DIR}/tex
   ${totk_vk_headers_SOURCE_DIR}/include ${totk_volk_SOURCE_DIR} ${totk_vma_SOURCE_DIR}/include)
 target_compile_definitions(totk_gfx_vk PUBLIC VK_NO_PROTOTYPES)
+target_include_directories(totk_gfx_vk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/overlay)   # overlay.h: the in-game menu's draw call (weak)
 if(WIN32)
   target_compile_definitions(totk_gfx_vk PUBLIC VK_USE_PLATFORM_WIN32_KHR)
 endif()
@@ -84,6 +85,20 @@ if(TARGET totk-win AND TOTK_GFX STREQUAL "vk" AND TOTK_SDL3_TARGET)
     ${RUNTIME_DIR}/frontend_win.c ${RUNTIME_DIR}/gamepad_sdl.c ${RUNTIME_DIR}/gamepad_feedback_sdl.c)
   target_compile_definitions(totk-win PRIVATE TOTK_WIN_FRONTEND=1)
   target_link_libraries(totk-win PRIVATE dwmapi)
+  # In-game menu (runtime/overlay): Dear ImGui, pinned to the launcher's version (tools/windows/launcher/build.py), with its
+  # SDL3 and Vulkan (volk) backends, drawn by nvn_vk_dev.c as the last pass before present.
+  FetchContent_Declare(totk_imgui
+    URL https://github.com/ocornut/imgui/archive/refs/tags/v1.91.9.tar.gz
+    URL_HASH SHA256=3872a5f90df78fced023c1945f4466b654fd74573370b77b17742149763a7a7c
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE SOURCE_SUBDIR no-cmake-build)
+  FetchContent_MakeAvailable(totk_imgui)
+  set(_imgui_srcs ${totk_imgui_SOURCE_DIR}/imgui.cpp ${totk_imgui_SOURCE_DIR}/imgui_draw.cpp ${totk_imgui_SOURCE_DIR}/imgui_tables.cpp
+    ${totk_imgui_SOURCE_DIR}/imgui_widgets.cpp ${totk_imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp ${totk_imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+  target_sources(totk-win PRIVATE ${RUNTIME_DIR}/overlay/overlay.cpp ${_imgui_srcs})
+  set_source_files_properties(${_imgui_srcs} ${RUNTIME_DIR}/overlay/overlay.cpp PROPERTIES COMPILE_OPTIONS "-std=c++17"
+    COMPILE_DEFINITIONS "IMGUI_IMPL_VULKAN_USE_VOLK")
+  set_source_files_properties(${_imgui_srcs} PROPERTIES COMPILE_OPTIONS "-std=c++17;-w")
+  target_include_directories(totk-win PRIVATE ${totk_imgui_SOURCE_DIR} ${RUNTIME_DIR}/overlay ${RUNTIME_DIR})
   target_include_directories(totk-win PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/d2r_gfx/host)
   target_link_libraries(totk-win PRIVATE totk_gfx_vk ${TOTK_SDL3_TARGET})
   set_target_properties(totk-win PROPERTIES LINKER_LANGUAGE CXX)

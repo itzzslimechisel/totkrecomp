@@ -53,7 +53,7 @@ The runtime stores the save in `<package>\user-data\save\<account id>\`; the id 
 
 ## Controls
 
-Keyboard: the same layout as the Mac build (`keymap_sdl.h`, remappable through `controls.txt`). Controllers: any SDL3-supported pad (XInput, DualSense, Switch Pro), rumble and motion. **F11 / Alt+Enter**: fullscreen. Closing the window waits for a running save.
+Keyboard: the same layout as the Mac build (`keymap_sdl.h`, remappable through `controls.txt`). Controllers: any SDL3-supported pad (XInput, DualSense, Switch Pro), rumble and motion. **F11 / Alt+Enter**: fullscreen. **F1 or Esc** (controller: **Minus + Plus** together) opens the in-game menu: Resume, the FPS counter (off / FPS / FPS + frame time, saved in `settings.ini` as `TOTK_FPS_OVERLAY`) and Quit (asks first; a save being written finishes). The game gets no input while the menu is open. Arrows / D-pad move, Enter / A chooses, B goes back; the mouse works too. Closing the window waits for a running save.
 
 ## What works / what is untested
 

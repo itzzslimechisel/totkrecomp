@@ -305,7 +305,11 @@ static void handle_key(const SDL_KeyboardEvent *k) {
     if (code != KEYMAP_NONE) runtime_input_key(code, down);
 }
 
+/* The in-game menu (runtime/overlay): it takes keyboard / mouse input while open; weak so the frontend tests link without it. */
+int overlay_event(const SDL_Event *e) __attribute__((weak));
+void overlay_init(SDL_Window *w) __attribute__((weak));
 static void handle_event(const SDL_Event *e) {
+    if (overlay_event && overlay_event(e)) return;
     if (gamepad_sdl_event(e)) return;
     switch (e->type) {
     case SDL_EVENT_QUIT: case SDL_EVENT_WINDOW_CLOSE_REQUESTED: close_window(); break;
@@ -356,6 +360,7 @@ int front_window_create(int hidden) {
     if (!window) { fprintf(stderr, "[totk] window creation failed: %s\n", SDL_GetError()); return 0; }
     { const char *fs = getenv("TOTK_FULLSCREEN"); if (fs && !strcmp(fs, "1") && !hidden) SDL_SetWindowFullscreen(window, true); }   /* start in borderless fullscreen (launcher setting) */
     sync_drawable();
+    if (overlay_init) overlay_init(window);
     return 1;
 }
 
