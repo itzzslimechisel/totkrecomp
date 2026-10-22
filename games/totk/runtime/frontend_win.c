@@ -364,6 +364,18 @@ int front_window_create(int hidden) {
     return 1;
 }
 
+/* TOTK_INPUT_FILE "sdlkey <scancode>" (runtime/input.c): a key press and release pushed into the SDL queue (thread-safe), so
+   scripted tests reach the in-game menu without giving the window the keyboard focus. */
+int runtime_front_sdl_key(unsigned scancode) {
+    if (!window) return 0;
+    SDL_Event e; memset(&e, 0, sizeof e);
+    e.type = SDL_EVENT_KEY_DOWN; e.key.scancode = (SDL_Scancode)scancode; e.key.key = SDL_GetKeyFromScancode((SDL_Scancode)scancode, SDL_KMOD_NONE, false);
+    e.key.down = true; e.key.windowID = SDL_GetWindowID(window);
+    if (!SDL_PushEvent(&e)) return 0;
+    e.type = SDL_EVENT_KEY_UP; e.key.down = false;
+    return SDL_PushEvent(&e) ? 1 : 0;
+}
+
 static DWORD WINAPI guest_main(void *callback) { ((void (*)(void))callback)(); return 0; }
 
 void runtime_front_run(void (*callback)(void)) {

@@ -501,7 +501,8 @@ static int swap_create(void) {
     uint32_t n = caps.minImageCount + 1; if (caps.maxImageCount && n > caps.maxImageCount) n = caps.maxImageCount; if (n > 8) n = 8;
     VkSwapchainKHR old = V.swap;
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, NULL, 0, V.surface, n, pick.format, pick.colorSpace, caps.currentExtent, 1,
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SHARING_MODE_EXCLUSIVE, 0, NULL, caps.currentTransform,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT),   /* SRC: "oshot" */
+        VK_SHARING_MODE_EXCLUSIVE, 0, NULL, caps.currentTransform,
         VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, getenv("TOTK_VK_VSYNC_OFF") ? VK_PRESENT_MODE_IMMEDIATE_KHR : VK_PRESENT_MODE_FIFO_KHR, VK_TRUE, old};
     if (ci.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
         uint32_t npm = 0; VkPresentModeKHR pm[16]; vkGetPhysicalDeviceSurfacePresentModesKHR(V.phys, V.surface, &npm, NULL); if (npm > 16) npm = 16;
@@ -582,6 +583,13 @@ static void present_shot(const tex_t *t, uint64_t n) {
     free(px);
 }
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket);
+/* TOTK_INPUT_FILE "oshot <path>": the next presented swapchain image (the game picture with the in-game menu / FPS counter
+   drawn over it), copied out after the present's submission and written as a PNG. */
+static char g_oshot_path[1024]; static _Atomic int g_oshot_pending;
+void dm_gfx_overlay_shot(const char *path) {
+    pthread_mutex_lock(&g_shot_mu); snprintf(g_oshot_path, sizeof g_oshot_path, "%s", path); pthread_mutex_unlock(&g_shot_mu);
+    atomic_store(&g_oshot_pending, 1);
+}
 uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
     (void)period_s;
     uint64_t ticket = ++g_present_n;
@@ -657,6 +665,22 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         overlay_vk_frame of = {V.inst, V.phys, V.dev, V.q, &V.qmu, V.qfam, V.nsimg, idx, cb, V.simg[idx], (uint32_t)V.sfmt, V.sext.width, V.sext.height, g_swap_gen};
         overlay_vk_draw(&of);
     }
+    VkBuffer obuf = VK_NULL_HANDLE; VmaAllocation oal = NULL; VmaAllocationInfo oinf = {0};
+    if (atomic_exchange(&g_oshot_pending, 0)) {   /* "oshot": copy the finished swapchain image out (read after the fence below) */
+        VkBufferCreateInfo bi = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, (VkDeviceSize)V.sext.width * V.sext.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_SHARING_MODE_EXCLUSIVE};
+        VmaAllocationCreateInfo bai = {0}; bai.usage = VMA_MEMORY_USAGE_AUTO; bai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        if (vmaCreateBuffer(V.vma, &bi, &bai, &obuf, &oal, &oinf) == VK_SUCCESS) {
+            VkImageMemoryBarrier2 ob = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 0, 0, V.simg[idx], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            VkDependencyInfo od = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &ob};
+            vkCmdPipelineBarrier2(cb, &od);
+            VkBufferImageCopy c = {0, 0, 0, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {V.sext.width, V.sext.height, 1}};
+            vkCmdCopyImageToBuffer(cb, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, obuf, 1, &c);
+            ob.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT; ob.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT; ob.dstStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT; ob.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            ob.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL; ob.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            vkCmdPipelineBarrier2(cb, &od);
+        } else obuf = VK_NULL_HANDLE;
+    }
     VkImageMemoryBarrier2 pb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_NONE, 0,
         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, 0, 0, V.simg[idx], {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkDependencyInfo d3 = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 0, NULL, 0, NULL, 1, &pb};
@@ -671,6 +695,16 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &V.s_done[idx], 1, &V.swap, &idx, NULL};
     r = vkQueuePresentKHR(V.q, &pi);
     pthread_mutex_unlock(&V.qmu);
+    if (obuf) {
+        vkWaitForFences(V.dev, 1, &pfence[fi], VK_TRUE, UINT64_MAX);
+        uint8_t *px = oinf.pMappedData; size_t n = (size_t)V.sext.width * V.sext.height;
+        int bgr = V.sfmt == VK_FORMAT_B8G8R8A8_UNORM || V.sfmt == VK_FORMAT_B8G8R8A8_SRGB;
+        for (size_t i = 0; i < n; i++) { if (bgr) { uint8_t t0 = px[4 * i]; px[4 * i] = px[4 * i + 2]; px[4 * i + 2] = t0; } px[4 * i + 3] = 255; }
+        char p[1024]; pthread_mutex_lock(&g_shot_mu); snprintf(p, sizeof p, "%s", g_oshot_path); pthread_mutex_unlock(&g_shot_mu);
+        if (nvn_vk_write_png && nvn_vk_write_png(p, px, V.sext.width, V.sext.height)) VKLOG("screenshot with overlay %ux%u -> %s", V.sext.width, V.sext.height, p);
+        else VKLOG("screenshot with overlay %s failed", p);
+        vmaDestroyBuffer(V.vma, obuf, oal);
+    }
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swap_create();
     return ticket;
 }

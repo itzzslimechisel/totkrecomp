@@ -48,6 +48,7 @@ def main():
     ap.add_argument('--shots', default='')
     ap.add_argument('--keys', default='', help='sec:keycode:ms,... pressed through the input file')
     ap.add_argument('--window', default='', help='a:b,... seconds after the first frame to report separately')
+    ap.add_argument('--cmds', default='', help='sec:command;... raw TOTK_INPUT_FILE commands (e.g. "50:sdlkey 58;52:oshot out.png")')
     ap.add_argument('--env', action='append', default=[])
     ap.add_argument('--shader-cache', help='shader cache folder (default: the package one)')
     a = ap.parse_args()
@@ -81,6 +82,7 @@ def main():
         env.pop('TOTK_AUDIO_OFF', None)
     if a.autoload:
         env['TOTK_AUTOLOAD'] = '1'
+    env.setdefault('TOTK_ASSUME_FOCUS', '1')   # scripted runs do not take the keyboard from whatever the user is doing
     for kv in a.env:
         k, v = kv.split('=', 1); env[k] = v
 
@@ -92,6 +94,9 @@ def main():
         events.append((float(t), f'key {code} {ms}' if int(ms) <= 5000 else f'down {code}'))
         if int(ms) > 5000:
             events.append((float(t) + int(ms) / 1000, f'up {code}'))
+    for c in filter(None, a.cmds.split(';')):
+        t, cmd = c.split(':', 1)
+        events.append((float(t), cmd.strip()))
     events.sort()
 
     t0 = time.time()

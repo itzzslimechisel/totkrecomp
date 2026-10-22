@@ -189,6 +189,15 @@ static void *input_file(void *arg) {
         } else if (!strncmp(line, "shot ", 5)) {
             line[strcspn(line, "\r\n")] = 0; if (!line[5]) runtime_fail("diagnostic screenshot path");
             dm_gfx_shot_at(2, line + 5);
+        } else if (sscanf(line, "sdlkey %u %n", &code, &used) == 1 && used && !line[used] && code < 512) {
+            /* "sdlkey <SDL scancode>": a key press and release through the window's own event queue, seen like a real key
+               (the in-game menu included) without the window needing the keyboard focus (Windows) */
+            extern int runtime_front_sdl_key(unsigned scancode) __attribute__((weak));
+            if (!runtime_front_sdl_key || !runtime_front_sdl_key(code)) fprintf(stderr, "[totk] sdlkey: no SDL window\n");
+        } else if (!strncmp(line, "oshot ", 6)) {   /* "oshot <path>": the next presented picture with the in-game menu / FPS counter (Windows, Vulkan) */
+            line[strcspn(line, "\r\n")] = 0; if (!line[6]) runtime_fail("diagnostic oshot path");
+            extern void dm_gfx_overlay_shot(const char *path) __attribute__((weak));
+            if (dm_gfx_overlay_shot) dm_gfx_overlay_shot(line + 6); else fprintf(stderr, "[totk] oshot: not available in this build\n");
         } else if (!strncmp(line, "wshot ", 6)) {   /* "wshot <path>": the next shown picture as the window shows it (FPS box and the bottom-left box included) */
             line[strcspn(line, "\r\n")] = 0; if (!line[6]) runtime_fail("diagnostic window screenshot path");
             extern void dm_gfx_window_shot(const char *path); dm_gfx_window_shot(line + 6);
