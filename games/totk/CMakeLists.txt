@@ -263,7 +263,7 @@ export PATH=\"/usr/bin:$(cygpath -u '${_cc_dir}'):$PATH\"
     COMMENT "NVN host-trap signatures")
   add_executable(totk-win
     ${RUNTIME_DIR}/loader_win.c ${RUNTIME_DIR}/jit_glue.c ${RUNTIME_DIR}/frontend_null.c ${RUNTIME_DIR}/audio_out_wasapi.c
-    ${RUNTIME_DIR}/win/win_posix.c ${RUNTIME_DIR}/win/sha256.c ${RUNTIME_DIR}/win/stubs_win.c ${RUNTIME_DIR}/win/prof_win.c
+    ${RUNTIME_DIR}/win/win_posix.c ${RUNTIME_DIR}/win/sha256.c ${RUNTIME_DIR}/win/stubs_win.c ${RUNTIME_DIR}/win/prof_win.c ${RUNTIME_DIR}/win/settings_ini.c
     ${RUNTIME_DIR}/services.c ${RUNTIME_DIR}/threads.c ${RUNTIME_DIR}/ipc.c
     ${RUNTIME_DIR}/fs_host.c ${RUNTIME_DIR}/romfs.c ${RUNTIME_DIR}/account.c ${RUNTIME_DIR}/time_host.c
     ${RUNTIME_DIR}/applet_host.c ${RUNTIME_DIR}/swkbd_host.c ${RUNTIME_DIR}/input.c ${RUNTIME_DIR}/hid_feedback.c
@@ -326,6 +326,10 @@ if(TOTK_BUILD_TESTS)
     target_link_libraries(test_audio_out_wasapi PRIVATE totk_audio_out)
     add_test(NAME audio_out_wasapi COMMAND test_audio_out_wasapi)
     set_tests_properties(audio_out_wasapi PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+    # <package>\settings.ini shared by the launcher and the game.
+    add_executable(test_settings_ini tests/settings_ini/test_settings_ini.c ${RUNTIME_DIR}/win/settings_ini.c)
+    target_include_directories(test_settings_ini PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME settings_ini COMMAND test_settings_ini)
   endif()
   if(TOTK_SDL3_TARGET)
     # Headless: SDL enums only.

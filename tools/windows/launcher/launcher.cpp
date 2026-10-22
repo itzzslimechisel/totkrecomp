@@ -83,7 +83,30 @@ static void parse_settings(const S &text, std::map<S, S> &m) {
         m[line.substr(5, eq - 5)] = line.substr(eq + 1, end - eq - 1);
     }
 }
-static bool load_settings() { S t; if (!read_text(here + L"settings.bat", t)) return false; kv.clear(); parse_settings(t, kv); return true; }
+/* settings.ini (runtime/win/settings_ini.h): NAME=VALUE lines shared with the game, whose in-game menu writes it; its
+   values win over settings.bat, which is still written for the .bat launcher. */
+static void parse_ini(const S &text, std::map<S, S> &m) {
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t e = text.find('\n', pos); if (e == S::npos) e = text.size();
+        S line = text.substr(pos, e - pos); pos = e + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
+        size_t a = line.find_first_not_of(" \t"); if (a == S::npos) continue;
+        line = line.substr(a);
+        if (line[0] == ';' || line[0] == '#' || line[0] == '[') continue;
+        size_t eq = line.find('='); if (eq == S::npos || !eq) continue;
+        S k = line.substr(0, eq); while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+        if (k.empty() || k.find_first_of(" \t") != S::npos) continue;
+        S v = line.substr(eq + 1); size_t b = v.find_first_not_of(" \t"); v = b == S::npos ? S() : v.substr(b);
+        if (v.empty()) m.erase(k); else m[k] = v;
+    }
+}
+static bool load_settings() {
+    S t; if (!read_text(here + L"settings.bat", t)) return false;
+    kv.clear(); parse_settings(t, kv);
+    S ini; if (read_text(here + L"settings.ini", ini)) parse_ini(ini, kv);
+    return true;
+}
 
 static void save_settings() {
     static const char *known[] = { "TOTK_DATA", "TOTK_WINDOW_SIZE", "TOTK_FULLSCREEN", "TOTK_VK_VSYNC_OFF", "TOTK_FPS60", "TOTK_UNCAPPED_HZ",
@@ -99,6 +122,10 @@ static void save_settings() {
         o += "set \"" + p.first + "=" + p.second + "\"\r\n";
     }
     write_text(here + L"settings.bat", o);
+    S ini = "; Tears of the Kingdom " + dispver + " settings, shared by the launcher and the in-game menu (F1 / Esc).\r\n"
+            "; NAME=VALUE; a variable set in the environment overrides its line.\r\n";
+    for (auto &p : kv) if (!p.second.empty()) ini += p.first + "=" + p.second + "\r\n";
+    write_text(here + L"settings.ini", ini);
 }
 
 /* ---------- checks ---------- */
@@ -303,6 +330,15 @@ static void set_data_in(const WS &pkg, const S &data) {
     }
     if (!done) out += "set \"TOTK_DATA=" + data + "\"\r\n";
     write_text(pkg + L"settings.bat", out);
+    S ini; if (!read_text(pkg + L"settings.ini", ini)) return;   /* its TOTK_DATA line would win: rewrite that too */
+    S iout; pos = 0;
+    while (pos < ini.size()) {
+        size_t e = ini.find('\n', pos); if (e == S::npos) e = ini.size();
+        S line = ini.substr(pos, e + 1 - pos); pos = e + 1;
+        if (_strnicmp(line.c_str(), "TOTK_DATA=", 10)) iout += line;
+    }
+    if (!iout.empty() && iout.back() != '\n') iout += "\r\n";
+    write_text(pkg + L"settings.ini", iout + "TOTK_DATA=" + data + "\r\n");
 }
 
 /* ---------- file dialogs ---------- */
