@@ -308,6 +308,7 @@ static void handle_key(const SDL_KeyboardEvent *k) {
 /* The in-game menu (runtime/overlay): it takes keyboard / mouse input while open; weak so the frontend tests link without it. */
 int overlay_event(const SDL_Event *e) __attribute__((weak));
 void overlay_init(SDL_Window *w) __attribute__((weak));
+void overlay_main_tick(void) __attribute__((weak));
 static void handle_event(const SDL_Event *e) {
     if (overlay_event && overlay_event(e)) return;
     if (gamepad_sdl_event(e)) return;
@@ -394,6 +395,7 @@ void runtime_front_run(void (*callback)(void)) {
         SDL_UnlockMutex(uiLock);
         apply_title();
         gamepad_sdl_tick(runtime_now_ns());
+        if (overlay_main_tick) overlay_main_tick();
     }
 }
 
