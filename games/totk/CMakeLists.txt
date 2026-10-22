@@ -263,7 +263,7 @@ export PATH=\"/usr/bin:$(cygpath -u '${_cc_dir}'):$PATH\"
     COMMENT "NVN host-trap signatures")
   add_executable(totk-win
     ${RUNTIME_DIR}/loader_win.c ${RUNTIME_DIR}/jit_glue.c ${RUNTIME_DIR}/frontend_null.c ${RUNTIME_DIR}/audio_out_wasapi.c
-    ${RUNTIME_DIR}/win/win_posix.c ${RUNTIME_DIR}/win/sha256.c ${RUNTIME_DIR}/win/stubs_win.c
+    ${RUNTIME_DIR}/win/win_posix.c ${RUNTIME_DIR}/win/sha256.c ${RUNTIME_DIR}/win/stubs_win.c ${RUNTIME_DIR}/win/prof_win.c
     ${RUNTIME_DIR}/services.c ${RUNTIME_DIR}/threads.c ${RUNTIME_DIR}/ipc.c
     ${RUNTIME_DIR}/fs_host.c ${RUNTIME_DIR}/romfs.c ${RUNTIME_DIR}/account.c ${RUNTIME_DIR}/time_host.c
     ${RUNTIME_DIR}/applet_host.c ${RUNTIME_DIR}/swkbd_host.c ${RUNTIME_DIR}/input.c ${RUNTIME_DIR}/hid_feedback.c
@@ -281,7 +281,7 @@ export PATH=\"/usr/bin:$(cygpath -u '${_cc_dir}'):$PATH\"
   target_compile_definitions(totk-win PRIVATE TOTK_CPU_JIT=1 TOTK_GAME_${TOTK_GAME_VERSION_UPPER}=1 _FILE_OFFSET_BITS=64)
   target_compile_options(totk-win PRIVATE -include ${RUNTIME_DIR}/win/win_posix.h -Wno-sign-compare -Wno-missing-field-initializers
     -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable)
-  target_link_libraries(totk-win PRIVATE totk_cpu totk_platform opus bcrypt ole32 avrt -static -lpthread)
+  target_link_libraries(totk-win PRIVATE totk_cpu totk_platform opus bcrypt ole32 avrt winmm psapi -static -lpthread)
   target_include_directories(totk-win PRIVATE ${totk_opus_SOURCE_DIR}/include)
   if(TOTK_VPX_LIB)
     target_sources(totk-win PRIVATE ${RUNTIME_DIR}/movie_host.c)

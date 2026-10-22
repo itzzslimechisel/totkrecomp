@@ -157,6 +157,7 @@ static void *input_file(void *arg) {
     char line[1200];
     for (;;) {
         if (!fgets(line, sizeof line, f)) { if (ferror(f)) runtime_fail("diagnostic input read"); clearerr(f); usleep(100000); continue; }
+        { size_t n = strlen(line); if (n >= 2 && line[n - 2] == '\r' && line[n - 1] == '\n') { line[n - 2] = '\n'; line[n - 1] = 0; } }   /* CRLF (Windows editors / scripts) */
         if (runtime_survey_command(line)) continue;
         unsigned code, ms; int used = 0;
         if (sscanf(line, "down %u %n", &code, &used) == 1 && used && !line[used] && code < 128) {

@@ -19,8 +19,8 @@ void dm_gfx_passdump_next(long n) { (void)n; }
 void dm_gfx_anomdump(void) {}
 void dm_gfx_querylog_next(long n) { (void)n; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
-void dm_gfx_shot_at(long frames, const char *path) { (void)frames; (void)path; }
-void dm_gfx_window_shot(const char *path) { (void)path; }
+__attribute__((weak)) void dm_gfx_shot_at(long frames, const char *path) { (void)frames; (void)path; }   /* the Vulkan backend has its own */
+__attribute__((weak)) void dm_gfx_window_shot(const char *path) { (void)path; }
 /* game_patches_v143.c: Mach watchpoint diagnostics are Mac only. */
 void runtime_diag_frm_watch(double secs, unsigned off, int in_x) { (void)secs; (void)off; (void)in_x; fprintf(stderr, "[totk] frmwatch: Mac only\n"); }
 void runtime_diag_xpoke(unsigned off, float value) { (void)off; (void)value; fprintf(stderr, "[totk] xpoke: Mac only\n"); }
