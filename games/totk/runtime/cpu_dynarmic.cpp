@@ -298,7 +298,19 @@ Dynarmic::A64::UserConfig make_config(cpu_context *ctx, Callbacks *cb, bool nest
     uc.enable_cycle_counting = false;
     uc.define_unpredictable_behaviour = true;   // e.g. stlxr wzr, xzr, [x] (main+0xcd7548): store, discard the status, as the hardware does
     uc.check_halt_on_memory_access = g_backend->cfg.precise_aborts != 0;
-    uc.code_cache_size = nested ? 32u * 1024 * 1024 : 128u * 1024 * 1024;
+    // Floating-point accuracy (cpu_backend_config.fp_accuracy): 0 accurate (all safe optimizations only), 1 the usual
+    // emulator "auto" level (NaN payloads and the ASIMD standard-FPCR rounding are not reproduced bit for bit; the C++
+    // fallbacks for them were a visible share of JIT time), 2 also approximate FRECPE / FRSQRTE and ignore the global
+    // exclusive monitor.
+    if (g_backend->cfg.fp_accuracy >= 1) {
+        uc.unsafe_optimizations = true;
+        uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN | Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
+        if (g_backend->cfg.fp_accuracy >= 2)
+            uc.optimizations |= Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP | Dynarmic::OptimizationFlag::Unsafe_IgnoreGlobalMonitor;
+    }
+    // Reserved, committed on demand (dynarmic BlockOfCode). A full cache is flushed and everything recompiled: with 128 MiB
+    // the game's main thread spent ~40 % of its time recompiling during gameplay (TOTK_PROF, 1.4.3).
+    uc.code_cache_size = nested ? 64u * 1024 * 1024 : 512u * 1024 * 1024;
     return uc;
 }
 

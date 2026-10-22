@@ -66,6 +66,9 @@ typedef struct cpu_backend_config {
      * pc and the registers are exact only with precise_aborts (costs speed: every access checks for an abort). */
     int (*data_abort)(cpu_context *ctx, uint64_t pc, uint64_t addr, int is_write, void *user);
     int precise_aborts;
+    /* Floating-point accuracy: 0 exact, 1 "auto" (NaN payloads / ASIMD standard-FPCR rounding not bit-exact), 2 fast
+     * (also approximate reciprocal estimates, no global exclusive monitor). */
+    int fp_accuracy;
 } cpu_backend_config;
 
 int cpu_backend_init(const cpu_backend_config *cfg);
