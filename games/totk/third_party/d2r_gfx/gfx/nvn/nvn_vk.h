@@ -93,7 +93,9 @@ typedef struct vk_pool {
     uint8_t *shadow;                 // mode 0: what the GPU copy holds (for byte-exact dirty diffs)
     uint8_t *map;                    // mode 2: mapped mirror
     uint32_t *gen;                   // per 64 KiB chunk: bumped when an upload changed it (texture re-upload checks)
-    uint64_t *stamp;                 // per 64 KiB chunk: dirty-tracker stamp of the last sync (tracker mode)
+    uint64_t *stamp;                 // per 64 KiB chunk: dirty-tracker stamp taken when the chunk was write-protected (0: not protected)
+    uint64_t *changed;               // per chunk: present count of the last sync that found CPU changes
+    uint8_t *cold;                   // per chunk: log2 of the quiet presents needed before it is write-protected again
     uint32_t nchunk;
 } vk_pool;
 #define VK_CHUNK 65536u
@@ -102,8 +104,9 @@ int vk_buf_at(uint64_t addr, uint64_t len, VkBuffer *buf, VkDeviceSize *off);
 void vk_pools_sync(vk_sub *s);       // uploads the CPU changes of every mirrored pool (recorded into s->pre)
 uint32_t vk_range_gen(uint64_t addr, uint64_t len);   // sum of chunk generations over a range (changes when uploaded data changed)
 void vk_guest_write_from_gpu(uint8_t *dst, const void *src, size_t n);   // readback write: keeps the shadow in step
-// Optional dirty tracker (nvn_dirty.c once ported): now() = generation, since(addr,len,stamp) = written after stamp.
-typedef struct { uint64_t (*now)(void); int (*since)(const void *, size_t, uint64_t); } nvn_vk_dirty_hooks;
+// Optional dirty tracker (nvn_dirty.c): now() = generation, since(addr,len,stamp) = written after stamp, protect(addr,len) =
+// write-protect so that the next write is recorded.
+typedef struct { uint64_t (*now)(void); int (*since)(const void *, size_t, uint64_t); void (*protect)(const void *, size_t); } nvn_vk_dirty_hooks;
 void nvn_vk_set_dirty_hooks(const nvn_vk_dirty_hooks *h);
 
 // ---------- textures ----------

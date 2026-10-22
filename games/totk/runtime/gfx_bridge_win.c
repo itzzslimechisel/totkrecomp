@@ -2,6 +2,7 @@
    registers, its forced imports in the "totkgfx" registration section, nv::InitializeGraphics). The Mac-only write
    watchpoint diagnostics (TOTK_WATCH_ADDR) are not here. */
 #include "runtime.h"
+#include "host_fault.h"
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include <stdio.h>
@@ -17,7 +18,18 @@ uint64_t guest_ns(void) { return runtime_now_ns(); }
 void *module_of(const void *p) { (void)p; return NULL; }
 static int (*fault_hook)(void *, int, void *);
 static void (*prepare_hook)(void *, size_t);
-void dm_fault_hook_register(int (*fn)(void *, int, void *)) { if (fault_hook) runtime_fail("second gfx fault hook"); fault_hook = fn; }
+/* Write faults on write-protected pool pages (dirty-page tracking) are resolved in the first-chance vectored handler,
+   whatever thread and code they come from: the JIT's fastmem stores re-execute natively (no detour through dynarmic's
+   slow memory path and the data-abort halt), and host memcpy into guest memory works the same way. */
+static int veh_dirty(host_fault_info *info) {
+    if (info->kind != HOST_FAULT_ACCESS || info->access != HOST_ACCESS_WRITE || !fault_hook) return HOST_FAULT_CONTINUE;
+    return fault_hook((void *)(uintptr_t)info->addr, 1, NULL) ? HOST_FAULT_HANDLED : HOST_FAULT_CONTINUE;
+}
+void dm_fault_hook_register(int (*fn)(void *, int, void *)) {
+    if (fault_hook) runtime_fail("second gfx fault hook");
+    fault_hook = fn;
+    if (host_fault_add_handler(veh_dirty)) runtime_fail("dirty-page fault handler");
+}
 void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { if (prepare_hook) runtime_fail("second gfx prepare hook"); prepare_hook = fn; }
 void dm_res_report_register(void (*fn)(uint32_t, const char *)) { (void)fn; }
 extern uint64_t dm_host_write_pc;   /* nvn_dirty.c */

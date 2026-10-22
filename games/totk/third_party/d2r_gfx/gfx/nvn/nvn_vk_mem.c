@@ -98,6 +98,8 @@ void mtl_pool_add(const void *mem, uint64_t size) {
         p->map = inf.pMappedData;
         p->nchunk = (uint32_t)((p->hi - p->lo + VK_CHUNK - 1) / VK_CHUNK);
         p->gen = calloc(p->nchunk, sizeof *p->gen); p->stamp = calloc(p->nchunk, sizeof *p->stamp);
+        p->changed = calloc(p->nchunk, sizeof *p->changed); p->cold = malloc(p->nchunk);
+        if (p->cold) memset(p->cold, 2, p->nchunk);
         if (p->mode == 0) {
             p->shadow = malloc(p->hi - p->lo);
             if (!p->shadow) VKDIE("pool shadow of %llu bytes", (unsigned long long)(p->hi - p->lo));
@@ -119,7 +121,7 @@ static void pool_free(void *arg) {
     vk_pool *p = arg;
     if (p->mode == 1) { vkDestroyBuffer(V.dev, p->buf, NULL); vkFreeMemory(V.dev, p->imported, NULL); }
     else vmaDestroyBuffer(V.vma, p->buf, p->al);
-    free(p->shadow); free(p->gen); free(p->stamp); free(p);
+    free(p->shadow); free(p->gen); free(p->stamp); free(p->changed); free(p->cold); free(p);
 }
 void mtl_pool_del(const void *mem) {
     if (!V.ok) return;
@@ -133,10 +135,11 @@ void mtl_pool_del(const void *mem) {
 }
 void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) { (void)p; (void)off; (void)n; mtl_finish(); }
 
-/* Copies guest bytes the GPU copy does not have yet. Diff granularity: 256 bytes (runs merged when closer than 1 KiB). */
-static void sync_range(vk_sub *s, vk_pool *p, uintptr_t a, uintptr_t b, VkBufferCopy **cp, int *ncp, int *ccp, VkBuffer *stage_buf) {
+/* Copies guest bytes the GPU copy does not have yet. Diff granularity: 256 bytes (runs merged when closer than 1 KiB).
+   Returns 1 when something changed. */
+static int sync_range(vk_sub *s, vk_pool *p, uintptr_t a, uintptr_t b, VkBufferCopy **cp, int *ncp, int *ccp, VkBuffer *stage_buf) {
     const uint8_t *g = (const uint8_t *)a; uint8_t *sh = p->shadow + (a - p->lo);
-    size_t n = b - a, i = 0;
+    size_t n = b - a, i = 0; int changed = 0;
     while (i < n) {
         size_t k = i; const size_t G = 256;
         while (k < n && !memcmp(g + k, sh + k, (n - k) < G ? n - k : G)) k += G;
@@ -152,13 +155,23 @@ static void sync_range(vk_sub *s, vk_pool *p, uintptr_t a, uintptr_t b, VkBuffer
         (*cp)[(*ncp)++] = (VkBufferCopy){so, a + k - p->lo, e - k};
         for (uintptr_t c = (a + k - p->lo) / VK_CHUNK; c <= (a + e - 1 - p->lo) / VK_CHUNK; c++) p->gen[c]++;
         atomic_fetch_add(&g_stat_upload_bytes, e - k);
-        i = e;
+        i = e; changed = 1;
     }
+    return changed;
 }
+/* Mirror mode: comparing every pool byte with its shadow at each submission costs tens of milliseconds per frame (TOTK keeps
+   hundreds of MiB in memory pools). With the dirty tracker, a chunk the CPU has left alone for a while (1 << cold[c]
+   presents) is write-protected before its diff; later submissions skip it until a write is recorded (fault or host write
+   preparation), then it is diffed again, and protected later the next time (cold[c] grows) so that chunks written every
+   few frames do not fault all the time. Order: stamp, protect, diff: a write before the protection is in the diff, a
+   write after it is recorded with a newer generation than the stamp. */
+uint64_t mtl_present_count(void);
+static uint64_t g_skip_chunks, g_diff_chunks;
 void vk_pools_sync(vk_sub *s) {
     static VkBufferCopy *cp; static int ccp;
     int any = 0;
-    uint64_t now = g_hooks.now ? g_hooks.now() : 0;
+    const int track = g_hooks.now && g_hooks.since && g_hooks.protect;
+    const uint64_t frame = mtl_present_count();
     pthread_mutex_lock(&g_pmu);
     for (int pi = 0; pi < g_npools; pi++) {
         vk_pool *p = g_pools[pi];
@@ -173,13 +186,26 @@ void vk_pools_sync(vk_sub *s) {
         int ncp = 0; VkBuffer sb = VK_NULL_HANDLE;
         for (uint32_t c = 0; c < p->nchunk; c++) {
             uintptr_t a = p->lo + (uintptr_t)c * VK_CHUNK, b = a + VK_CHUNK > p->hi ? p->hi : a + VK_CHUNK;
-            if (g_hooks.since && p->stamp[c] && !g_hooks.since((const void *)a, b - a, p->stamp[c])) continue;
-            sync_range(s, p, a, b, &cp, &ncp, &ccp, &sb);
-            p->stamp[c] = now ? now : 1;
+            if (track) {
+                if (p->stamp[c]) {
+                    if (!g_hooks.since((const void *)a, b - a, p->stamp[c])) { g_skip_chunks++; continue; }
+                    p->stamp[c] = 0;
+                    if (p->cold[c] < 10) p->cold[c]++;
+                } else if (frame - p->changed[c] >= (1ull << p->cold[c])) {
+                    uint64_t st = g_hooks.now(); g_hooks.protect((const void *)a, b - a); p->stamp[c] = st ? st : 1;
+                }
+            }
+            g_diff_chunks++;
+            if (sync_range(s, p, a, b, &cp, &ncp, &ccp, &sb)) p->changed[c] = frame;
         }
         if (ncp) { vkCmdCopyBuffer(s->pre, sb, p->buf, (uint32_t)ncp, cp); any = 1; }
     }
     pthread_mutex_unlock(&g_pmu);
+    if (track && frame && frame % 600 == 0) {
+        static uint64_t logged; if (logged != frame) { logged = frame;
+            VKLOG("pool sync: %llu chunks diffed, %llu skipped (write-protected and unwritten) since the last report", (unsigned long long)g_diff_chunks, (unsigned long long)g_skip_chunks);
+            g_diff_chunks = g_skip_chunks = 0; }
+    }
     if (any) {
         VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};

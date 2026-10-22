@@ -10,7 +10,11 @@
 // The window belongs to the runtime frontend (runtime/frontend_win.c: SDL3 window, event loop on the main thread, input,
 // close, resize, F11). This backend only asks it for the Vulkan instance extensions and a surface.
 static void *surface(void *inst) { return (void *)(uintptr_t)front_vk_surface(inst); }
+// Pool uploads skip memory the game has not written (nvn_dirty.c write protection): see vk_pools_sync.
+#include "nvn_dirty.h"
+static const nvn_vk_dirty_hooks g_dirty_hooks = {nvn_dirty_now, nvn_dirty_since, nvn_dirty_protect};
 void nvn_vk_frontend_hook(void) {
+    if (!getenv("TOTK_VK_NO_DIRTY")) nvn_vk_set_dirty_hooks(&g_dirty_hooks);
     if (getenv("TOTK_VK_NO_WINDOW")) { VKLOG("TOTK_VK_NO_WINDOW: rendering offscreen"); return; }
     uint32_t n = 0; const char *const *ext = front_vk_instance_extensions(&n);
     if (ext && n) nvn_vk_set_window(surface, ext, n);
