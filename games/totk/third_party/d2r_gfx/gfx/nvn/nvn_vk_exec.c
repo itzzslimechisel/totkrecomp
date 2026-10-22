@@ -16,6 +16,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 VkBuffer vk_zero_buffer(void);
 VkDescriptorType vk_desc_type(int d);
@@ -168,6 +171,113 @@ static VkPrimitiveTopology topo_of(int prim, int *quads) {
 }
 static VkFormat dummy_attr_fmt(int cls) { return cls == 1 ? VK_FORMAT_R32G32B32A32_UINT : cls == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT; }
 
+/* Pipelines: looked up by a hash of the key, created on worker threads (the draw that first needs one is skipped until it
+   exists, so the render thread never waits for the driver's compiler; TOTK_SHADER_SYNC=1 creates them on the spot), all
+   through one VkPipelineCache kept on disk next to the shader cache (loaded before the first frame, saved every few
+   minutes when it grew and at exit). */
+typedef struct {
+    VkGraphicsPipelineCreateInfo gci; VkPipelineRenderingCreateInfo rci; VkPipelineShaderStageCreateInfo st[2];
+    VkVertexInputBindingDescription vb[17]; VkVertexInputAttributeDescription va[32];
+    VkPipelineVertexInputStateCreateInfo vi; VkPipelineInputAssemblyStateCreateInfo ia; VkPipelineViewportStateCreateInfo vps;
+    VkPipelineRasterizationStateCreateInfo rs; VkPipelineRasterizationDepthClipStateCreateInfoEXT dcs; VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds; VkPipelineColorBlendAttachmentState cba[8]; VkPipelineColorBlendStateCreateInfo cb;
+    VkDynamicState dyn[10]; VkPipelineDynamicStateCreateInfo dy; VkFormat cf[8];
+    VkComputePipelineCreateInfo cci; int compute;
+    struct vk_pipe *dst;
+} pipe_job;
+static VkPipelineCache g_pcache; static char g_pcache_path[1200]; static _Atomic int g_pcache_new;
+static pthread_mutex_t g_pipe_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pipe_cv = PTHREAD_COND_INITIALIZER;
+typedef struct pjq { pipe_job *j; struct pjq *next; } pjq;
+static pjq *g_pq, *g_pq_tail; static _Atomic int g_pipes_pending; static _Atomic uint64_t g_pipes_made, g_pipe_ns;
+static int shader_sync(void) { static int s = -1; if (s < 0) { const char *e = getenv("TOTK_SHADER_SYNC"); s = e && atoi(e); } return s; }
+const char *nvn_vk_cache_dir(void);
+void vk_pcache_init(void) {
+    if (g_pcache) return;
+    snprintf(g_pcache_path, sizeof g_pcache_path, "%s/vk-pipelines-%04x-%04x-%08x.bin", nvn_vk_cache_dir(), V.props.vendorID, V.props.deviceID, V.props.driverVersion);
+    void *data = NULL; size_t n = 0;
+    FILE *f = fopen(g_pcache_path, "rb");
+    if (f) { fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET); if (sz > 0 && (data = malloc((size_t)sz))) n = fread(data, 1, (size_t)sz, f); fclose(f); }
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, n, data};
+    if (vkCreatePipelineCache(V.dev, &ci, NULL, &g_pcache) != VK_SUCCESS) { ci.initialDataSize = 0; ci.pInitialData = NULL; vkCreatePipelineCache(V.dev, &ci, NULL, &g_pcache); n = 0; }
+    free(data);
+    VKLOG("pipeline cache %s: %zu bytes loaded", g_pcache_path, n);
+}
+void vk_pcache_save(void) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    if (!g_pcache || !atomic_exchange(&g_pcache_new, 0)) return;
+    pthread_mutex_lock(&mu);
+    size_t n = 0; void *data = NULL;
+    if (vkGetPipelineCacheData(V.dev, g_pcache, &n, NULL) == VK_SUCCESS && n && (data = malloc(n)) && vkGetPipelineCacheData(V.dev, g_pcache, &n, data) == VK_SUCCESS) {
+        char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.tmp", g_pcache_path);
+        FILE *f = fopen(tmp, "wb");
+        if (f) { int ok = fwrite(data, 1, n, f) == n; ok &= fclose(f) == 0; if (ok) { remove(g_pcache_path); rename(tmp, g_pcache_path); } }
+    }
+    free(data);
+    pthread_mutex_unlock(&mu);
+}
+static void *pcache_save_thread(void *arg) { (void)arg; vk_pcache_save(); return NULL; }
+void vk_pcache_tick(uint64_t present) {   // nvn_vk_dev.c present: every 3600 presents, in the background
+    if (present % 3600 || !atomic_load(&g_pcache_new)) return;
+    pthread_t t; if (!pthread_create(&t, NULL, pcache_save_thread, NULL)) pthread_detach(t);
+}
+static VkPipeline pipe_create(pipe_job *j) {
+    VkPipeline pipe = VK_NULL_HANDLE; uint64_t t0 = vk_now_ns();
+    VkResult r = j->compute ? vkCreateComputePipelines(V.dev, g_pcache, 1, &j->cci, NULL, &pipe) : vkCreateGraphicsPipelines(V.dev, g_pcache, 1, &j->gci, NULL, &pipe);
+    if (r != VK_SUCCESS) { VKLOG("%s pipeline creation failed: %d", j->compute ? "compute" : "graphics", r); pipe = VK_NULL_HANDLE; }
+    atomic_fetch_add(&g_pipe_ns, vk_now_ns() - t0); atomic_fetch_add(&g_pipes_made, 1); atomic_store(&g_pcache_new, 1);
+    return pipe;
+}
+typedef struct vk_pipe2 { pso_key k; uint64_t h; _Atomic(VkPipeline) p; _Atomic int state; struct vk_pipe2 *next; } vk_pipe2;   // state 0 pending, 1 ready, 2 failed
+static void *pipe_worker(void *arg) {
+    (void)arg;
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+    for (;;) {
+        pthread_mutex_lock(&g_pipe_mu);
+        while (!g_pq) pthread_cond_wait(&g_pipe_cv, &g_pipe_mu);
+        pjq *q = g_pq; g_pq = q->next; if (!g_pq) g_pq_tail = NULL;
+        pthread_mutex_unlock(&g_pipe_mu);
+        vk_pipe2 *dst = (vk_pipe2 *)q->j->dst;
+        VkPipeline p = pipe_create(q->j);
+        atomic_store(&dst->p, p); atomic_store(&dst->state, p ? 1 : 2);
+        atomic_fetch_sub(&g_pipes_pending, 1);
+        free(q->j); free(q);
+    }
+    return NULL;
+}
+static void fix_pointers(pipe_job *j, uint32_t nst, uint32_t nvb, uint32_t nva, uint32_t ncolor, int dcs) {
+    j->vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, nvb, j->vb, nva, j->va};
+    j->rs.pNext = dcs ? &j->dcs : NULL;
+    j->cb.pAttachments = j->cba; j->cb.attachmentCount = ncolor;
+    j->dy = (VkPipelineDynamicStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 10, j->dyn};
+    j->rci.pColorAttachmentFormats = j->cf;
+    j->gci = (VkGraphicsPipelineCreateInfo){VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &j->rci, 0, nst, j->st, &j->vi, &j->ia, NULL, &j->vps, &j->rs, &j->ms, &j->ds, &j->cb, &j->dy, VK_NULL_HANDLE, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
+}
+static uint64_t key_hash(const pso_key *k) { return vk_hash(k, sizeof *k, 0x51ed270b27f1a3c5ull); }
+static vk_pipe2 *pipe_find(vk_prog *pr, const pso_key *k, uint64_t h) {
+    for (vk_pipe2 *p = (vk_pipe2 *)__atomic_load_n(&pr->pipes, __ATOMIC_ACQUIRE); p; p = p->next) if (p->h == h && !memcmp(&p->k, k, sizeof *k)) return p;
+    return NULL;
+}
+/* Returns the pipeline, or VK_NULL_HANDLE (being created / failed: skip the draw). */
+static VkPipeline pipe_submit(vk_prog *pr, const pso_key *k, uint64_t h, pipe_job *j) {
+    vk_pipe2 *np = calloc(1, sizeof *np); np->k = *k; np->h = h; j->dst = (struct vk_pipe *)np;
+    if (j->compute) j->cci.layout = pr->layout; else j->gci.layout = pr->layout;
+    if (shader_sync()) { VkPipeline p = pipe_create(j); atomic_store(&np->p, p); atomic_store(&np->state, p ? 1 : 2); free(j); }
+    else {
+        static int workers; pjq *q = malloc(sizeof *q); q->j = j; q->next = NULL;
+        pthread_mutex_lock(&g_pipe_mu);
+        if (g_pq_tail) g_pq_tail->next = q; else g_pq = q;
+        g_pq_tail = q; atomic_fetch_add(&g_pipes_pending, 1);
+        for (; workers < 3; workers++) { pthread_t t; if (pthread_create(&t, NULL, pipe_worker, NULL)) break; pthread_detach(t); }
+        pthread_cond_signal(&g_pipe_cv);
+        pthread_mutex_unlock(&g_pipe_mu);
+    }
+    np->next = (vk_pipe2 *)pr->pipes; __atomic_store_n(&pr->pipes, (struct vk_pipe *)np, __ATOMIC_RELEASE);   // only the submit thread adds
+    return atomic_load(&np->p);
+}
+void vk_pipe_stats(uint64_t *made, uint64_t *ns, int *pending) { *made = atomic_load(&g_pipes_made); *ns = atomic_load(&g_pipe_ns); *pending = atomic_load(&g_pipes_pending); }
+
 static VkPipeline pso_get(vk_prog *pr, VkPrimitiveTopology topo) {
     pso_key k; memset(&k, 0, sizeof k);
     k.prog = pr; memcpy(k.cfmt, P.cfmt, sizeof k.cfmt); k.dfmt = P.dfmt; k.sfmt = P.sfmt; k.samples = P.samples; k.ncolor = P.ncolor;
@@ -179,75 +289,71 @@ static VkPipeline pso_get(vk_prog *pr, VkPrimitiveTopology topo) {
     vk_shader *vs = pr->sh[0];
     for (int i = 0; vs && i < vs->nv; i++) { int loc = vs->v[i].loc; k.vattr[i] = loc < S.nattr || loc < 16 ? S.attr[loc & 15] : 0; }
     for (int i = 0; i < 16; i++) { k.vstride[i] = S.stream[i].stride; k.vdiv[i] = S.stream[i].divisor; }
-    for (vk_pipe *p = pr->pipes; p; p = p->next) if (!memcmp(&p->k, &k, sizeof k)) return p->p;
+    uint64_t h = key_hash(&k);
+    vk_pipe2 *found = pipe_find(pr, &k, h);
+    if (found) return atomic_load(&found->p);
 
-    VkPipelineShaderStageCreateInfo st[2]; int nst = 0;
-    for (int s = 0; s < 2; s++) if (pr->sh[s]) st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
+    pipe_job *j = calloc(1, sizeof *j);
+    uint32_t nst = 0;
+    for (int s = 0; s < 2; s++) if (pr->sh[s]) j->st[nst++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0,
         s == 0 ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT, pr->sh[s]->mod, pr->sh[s]->entry, NULL};
-    VkVertexInputBindingDescription vb[17]; VkVertexInputAttributeDescription va[32]; uint32_t nvb = 0, nva = 0; uint32_t used_streams = 0; int need_dummy = 0;
+    uint32_t nvb = 0, nva = 0; uint32_t used_streams = 0; int need_dummy = 0;
     for (int i = 0; vs && i < vs->nv; i++) {
         int loc = vs->v[i].loc; va_st a; uint32_t raw = S.attr[loc & 15]; memcpy(&a, &raw, 4);
         VkFormat f = loc < 16 && a.fmt ? (VkFormat)nvn_vertex_fmt_vk((int)a.fmt) : VK_FORMAT_UNDEFINED;
-        if (!f) { va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)loc, 16, dummy_attr_fmt(vs->v[i].cls), 0}; need_dummy = 1; continue; }
-        va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)loc, a.stream, f, a.offset};
+        if (!f) { j->va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)loc, 16, dummy_attr_fmt(vs->v[i].cls), 0}; need_dummy = 1; continue; }
+        j->va[nva++] = (VkVertexInputAttributeDescription){(uint32_t)loc, a.stream, f, a.offset};
         used_streams |= 1u << a.stream;
     }
     for (int sidx = 0; sidx < 16; sidx++) if (used_streams & (1u << sidx))
-        vb[nvb++] = (VkVertexInputBindingDescription){(uint32_t)sidx, S.stream[sidx].stride, S.stream[sidx].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
-    if (need_dummy) vb[nvb++] = (VkVertexInputBindingDescription){16, 0, VK_VERTEX_INPUT_RATE_VERTEX};
-    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, nvb, vb, nva, va};
-    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, topo, VK_FALSE};
-    VkPipelineViewportStateCreateInfo vps = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
+        j->vb[nvb++] = (VkVertexInputBindingDescription){(uint32_t)sidx, S.stream[sidx].stride, S.stream[sidx].divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+    if (need_dummy) j->vb[nvb++] = (VkVertexInputBindingDescription){16, 0, VK_VERTEX_INPUT_RATE_VERTEX};
+    j->ia = (VkPipelineInputAssemblyStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0, topo, VK_FALSE};
+    j->vps = (VkPipelineViewportStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL};
     int pm = S.poly.mode;
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, S.depth_clamp ? VK_TRUE : VK_FALSE, S.raster_discard ? VK_TRUE : VK_FALSE,
+    j->rs = (VkPipelineRasterizationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, S.depth_clamp ? VK_TRUE : VK_FALSE, S.raster_discard ? VK_TRUE : VK_FALSE,
         !V.f_fill_mode_non_solid || pm == NVN_POLYGON_MODE_FILL ? VK_POLYGON_MODE_FILL : pm == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_POINT,
         VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1.0f};
-    VkPipelineRasterizationDepthClipStateCreateInfoEXT dcs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT, NULL, 0, VK_TRUE};
-    if (S.depth_clamp && V.f_depth_clip) { dcs.depthClipEnable = VK_FALSE; rs.pNext = &dcs; }
-    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, P.samples, VK_FALSE, 0, NULL, S.ms.a2c ? VK_TRUE : VK_FALSE, VK_FALSE};
+    j->dcs = (VkPipelineRasterizationDepthClipStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_DEPTH_CLIP_STATE_CREATE_INFO_EXT, NULL, 0, VK_FALSE};
+    int dcs = S.depth_clamp && V.f_depth_clip;
+    j->ms = (VkPipelineMultisampleStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, P.samples, VK_FALSE, 0, NULL, S.ms.a2c ? VK_TRUE : VK_FALSE, VK_FALSE};
     VkStencilOpState sf = {stop((int)S.ds.fail_f), stop((int)S.ds.zpass_f), stop((int)S.ds.zfail_f), cmpop((int)S.ds.sf_f), 0xff, 0xff, 0};
     VkStencilOpState sb = {stop((int)S.ds.fail_b), stop((int)S.ds.zpass_b), stop((int)S.ds.zfail_b), cmpop((int)S.ds.sf_b), 0xff, 0xff, 0};
-    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0,
+    j->ds = (VkPipelineDepthStencilStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0,
         P.dfmt && S.ds.dt ? VK_TRUE : VK_FALSE, P.dfmt && S.ds.dt && S.ds.dw ? VK_TRUE : VK_FALSE, cmpop((int)S.ds.df), VK_FALSE, P.sfmt && S.ds.st ? VK_TRUE : VK_FALSE, sf, sb, 0, 1};
-    VkPipelineColorBlendAttachmentState cba[8];
     for (uint32_t i = 0; i < P.ncolor; i++) {
         const blend_st *b = &S.blend[i];
-        cba[i] = (VkPipelineColorBlendAttachmentState){(S.color.blend_en >> i) & 1 ? VK_TRUE : VK_FALSE, bfac((int)b->src_rgb), bfac((int)b->dst_rgb), bop((int)b->eq_rgb),
+        j->cba[i] = (VkPipelineColorBlendAttachmentState){(S.color.blend_en >> i) & 1 ? VK_TRUE : VK_FALSE, bfac((int)b->src_rgb), bfac((int)b->dst_rgb), bop((int)b->eq_rgb),
             bfac((int)b->src_a), bfac((int)b->dst_a), bop((int)b->eq_a), (S.chmask.mask >> (4 * i)) & 0xf};
-        if (!P.cfmt[i]) cba[i].colorWriteMask = 0;
-        if (cba[i].blendEnable && P.cfmt[i]) {   // integer formats cannot blend
+        if (!P.cfmt[i]) j->cba[i].colorWriteMask = 0;
+        if (j->cba[i].blendEnable && P.cfmt[i]) {   // integer formats cannot blend
             VkFormatProperties fp; vkGetPhysicalDeviceFormatProperties(V.phys, (VkFormat)P.cfmt[i], &fp);
-            if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) cba[i].blendEnable = VK_FALSE;
+            if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT)) j->cba[i].blendEnable = VK_FALSE;
         }
     }
     int lop = S.color.logic_op != NVN_LOGIC_OP_COPY && V.f_logic_op;
-    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, lop ? VK_TRUE : VK_FALSE,
-        lop ? (VkLogicOp)(S.color.logic_op & 15) : VK_LOGIC_OP_COPY, P.ncolor, cba, {0, 0, 0, 0}};
+    j->cb = (VkPipelineColorBlendStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, lop ? VK_TRUE : VK_FALSE,
+        lop ? (VkLogicOp)(S.color.logic_op & 15) : VK_LOGIC_OP_COPY, P.ncolor, NULL, {0, 0, 0, 0}};
     if (S.color.logic_op != NVN_LOGIC_OP_COPY && !V.f_logic_op) VKONCE("logic op %u not supported by the device", S.color.logic_op);
-    VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
+    static const VkDynamicState dyn[10] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
         VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
-    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, sizeof dyn / sizeof *dyn, dyn};
-    VkFormat cf[8]; for (uint32_t i = 0; i < P.ncolor; i++) cf[i] = (VkFormat)P.cfmt[i];
-    VkPipelineRenderingCreateInfo rci = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, P.ncolor, cf, (VkFormat)P.dfmt, (VkFormat)P.sfmt};
-    VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rci, 0, (uint32_t)nst, st, &vi, &ia, NULL, &vps, &rs, &ms, &ds, &cb, &dy, pr->layout, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
-    VkPipeline pipe;
-    VkResult r = vkCreateGraphicsPipelines(V.dev, VK_NULL_HANDLE, 1, &gci, NULL, &pipe);
-    if (r != VK_SUCCESS) { VKLOG("graphics pipeline creation failed: %d", r); return VK_NULL_HANDLE; }
-    vk_pipe *np = malloc(sizeof *np); np->k = k; np->p = pipe; np->next = pr->pipes; pr->pipes = np;
-    return pipe;
+    memcpy(j->dyn, dyn, sizeof dyn);
+    for (uint32_t i = 0; i < P.ncolor; i++) j->cf[i] = (VkFormat)P.cfmt[i];
+    j->rci = (VkPipelineRenderingCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, P.ncolor, NULL, (VkFormat)P.dfmt, (VkFormat)P.sfmt};
+    fix_pointers(j, nst, nvb, nva, P.ncolor, dcs);
+    return pipe_submit(pr, &k, h, j);
 }
 static VkPipeline cps_get(vk_prog *pr) {
     pso_key k; memset(&k, 0, sizeof k); k.prog = pr; k.topo = 255;
-    for (vk_pipe *p = pr->pipes; p; p = p->next) if (!memcmp(&p->k, &k, sizeof k)) return p->p;
-    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, pr->sh[5]->mod, pr->sh[5]->entry, NULL}, pr->layout, VK_NULL_HANDLE, -1};
-    VkPipeline pipe;
-    if (vkCreateComputePipelines(V.dev, VK_NULL_HANDLE, 1, &ci, NULL, &pipe) != VK_SUCCESS) { VKLOG("compute pipeline creation failed"); return VK_NULL_HANDLE; }
-    vk_pipe *np = malloc(sizeof *np); np->k = k; np->p = pipe; np->next = pr->pipes; pr->pipes = np;
-    return pipe;
+    uint64_t h = key_hash(&k);
+    vk_pipe2 *found = pipe_find(pr, &k, h);
+    if (found) return atomic_load(&found->p);
+    pipe_job *j = calloc(1, sizeof *j); j->compute = 1;
+    j->cci = (VkComputePipelineCreateInfo){VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, NULL, 0,
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_COMPUTE_BIT, pr->sh[5]->mod, pr->sh[5]->entry, NULL}, VK_NULL_HANDLE, VK_NULL_HANDLE, -1};
+    return pipe_submit(pr, &k, h, j);
 }
-
 // ---------- descriptors (nvn_mtl.m encode_args, binding kinds of nvn_refl.h) ----------
 static void driver_bank_fill(uint8_t *d, int bank, int stage) {
     memset(d, 0, 0xA00);
@@ -732,6 +838,25 @@ int vk_exec_answers(int st, char *buf, size_t n) {
     AP("}}");
 #undef AP
     return (int)o;
+}
+/* The same facts as vk_exec_answers, hashed instead of written as text: the per-draw program lookup key (formatting the
+   answers with snprintf at every draw took about half of the submission CPU time). */
+static inline uint64_t mix(uint64_t h, uint64_t v) { h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2); return h * 0x100000001B3ull; }
+uint64_t vk_exec_answer_key(int st, uint64_t h) {
+    if (!g_inited) { g_inited = 1; state_reset(); }
+    if (st >= 6) return h;
+    h = mix(h, 0x7e5 + (uint64_t)st);
+    for (int r = 0; r < 128; r++) if (S.tex[st][r]) { int tg, f; if (!vk_reg_info((int)(S.tex[st][r] & 0xfffff), &tg, &f)) continue;
+        h = mix(h, (uint64_t)r << 32 | (uint64_t)(tg & 0xff) << 8 | (f >= 0x32 && f <= 0x36)); }
+    h = mix(h, 0x1a6);
+    for (int r = 0; r < 32; r++) if (S.img[st][r]) { int tg, f; if (!vk_reg_info((int)(S.img[st][r] & 0xfffff), &tg, &f)) continue;
+        h = mix(h, (uint64_t)r << 32 | (uint64_t)(tg & 0xff) << 16 | (uint64_t)(image_format(f) ? (unsigned)f & 0xffff : 0xffff)); }
+    h = mix(h, 0xa77);
+    if (st == 0) for (int i = 0; i < S.nattr && i < 16; i++) { va_st a; memcpy(&a, &S.attr[i], 4); h = mix(h, (uint64_t)i << 8 | (uint64_t)(uintptr_t)fmt_class((int)a.fmt)[0]); }
+    h = mix(h, 0xf0a);
+    if (st == 1 && R.has_rt) for (int i = 0; i < R.rt.n && i < 8; i++) if (R.rt.color[i])
+        h = mix(h, (uint64_t)i << 8 | (uint64_t)(uintptr_t)fmt_class(R.rt.has_cview[i] && R.rt.cview[i].set_format ? R.rt.cview[i].format : R.rt.color[i]->d.format)[0]);
+    return h;
 }
 void mtl_exec_rest(const uint64_t *handles, int n) { (void)handles; (void)n; }
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }

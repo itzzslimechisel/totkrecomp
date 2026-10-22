@@ -282,6 +282,13 @@ static vk_sub *sub_new(void) {
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     VKCHECK(vkResetCommandBuffer(s->pre, 0)); VKCHECK(vkBeginCommandBuffer(s->pre, &bi));
     VKCHECK(vkResetCommandBuffer(s->cb, 0)); VKCHECK(vkBeginCommandBuffer(s->cb, &bi));
+    {   // everything submitted before (earlier submissions, presents that blit a rendering) completes its memory accesses first:
+        // nothing waits on the CPU for the GPU between submissions any more
+        VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                               VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT};
+        VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 1, &mb};
+        vkCmdPipelineBarrier2(s->pre, &di);
+    }
     return s;
 }
 VkDescriptorSet vk_desc_alloc(VkDescriptorSetLayout l) {
@@ -361,6 +368,12 @@ void mtl_init(void) {
     if (!g_big_init) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_big, &a); g_big_init = 1; }
     if (nvn_vk_frontend_hook) nvn_vk_frontend_hook();
     if (!nvn_vk_device_init()) { VKLOG("Vulkan backend unavailable: GPU work is skipped"); return; }
+    {   // before the first frame: the shader variant index, the pipeline cache; the device's translator caps for prepare_shaders.py
+        void nvn_vk_shader_index_load(void); void vk_pcache_init(void); void vk_pcache_save(void); const char *nvn_vk_cache_dir(void);
+        nvn_vk_shader_index_load(); vk_pcache_init(); atexit(vk_pcache_save);
+        char p[1200]; snprintf(p, sizeof p, "%s/vk-caps.json", nvn_vk_cache_dir());
+        FILE *f = fopen(p, "wb"); if (f) { fputs(nvn_vk_translator_caps(), f); fclose(f); }
+    }
     if (!g_comp_started) { g_comp_started = 1; pthread_create(&g_comp_thread, NULL, comp_main, NULL); }
 }
 void mtl_sub_begin(void) {
@@ -538,8 +551,24 @@ static uint8_t *read_rgba8_(const tex_t *t, uint32_t *w, uint32_t *h) {
 }
 int nvn_vk_write_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) __attribute__((weak));
 void nvn_vk_present_hook(void) __attribute__((weak));
+/* Screenshot of the n-th next presented picture (TOTK_INPUT_FILE "shot <path>" / "wshot <path>": runtime/input.c). */
+static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_shot_path[1024]; static long g_shot_in;
+void dm_gfx_shot_at(long frames, const char *path) {
+    pthread_mutex_lock(&g_shot_mu); snprintf(g_shot_path, sizeof g_shot_path, "%s", path); g_shot_in = frames > 0 ? frames : 1; pthread_mutex_unlock(&g_shot_mu);
+}
+void dm_gfx_window_shot(const char *path) { dm_gfx_shot_at(1, path); }
 static void present_shot(const tex_t *t, uint64_t n) {
     static const char *dir; static long every = -1;
+    {
+        char p[1024]; int take = 0;
+        pthread_mutex_lock(&g_shot_mu); if (g_shot_in > 0 && --g_shot_in == 0) { snprintf(p, sizeof p, "%s", g_shot_path); take = 1; } pthread_mutex_unlock(&g_shot_mu);
+        if (take && nvn_vk_write_png) {
+            uint32_t w, h; uint8_t *px = nvn_vk_read_rgba8(t, &w, &h);
+            if (px && nvn_vk_write_png(p, px, w, h)) VKLOG("screenshot %ux%u -> %s", w, h, p); else VKLOG("screenshot %s failed", p);
+            free(px);
+        }
+    }
     if (every < 0) { dir = getenv("TOTK_VK_SHOT"); const char *e = getenv("TOTK_VK_SHOT_EVERY"); every = e ? atol(e) : 60; if (every < 1) every = 60; }
     if (!dir || !nvn_vk_write_png || n % (uint64_t)every) return;
     uint32_t w, h; uint8_t *px = nvn_vk_read_rgba8(t, &w, &h); if (!px) return;
@@ -557,6 +586,9 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 }
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     present_shot(t, ticket);
+    { void vk_pcache_tick(uint64_t); vk_pcache_tick(ticket); }
+    if (ticket % 600 == 0) { void vk_pipe_stats(uint64_t *, uint64_t *, int *); uint64_t made, ns; int pend; vk_pipe_stats(&made, &ns, &pend);
+        VKLOG("pipelines: %llu created (%.1f ms average, on worker threads), %d being created", (unsigned long long)made, made ? ns / 1e6 / made : 0.0, pend); }
     if (ticket == 1 || ticket % 600 == 0) VKLOG("present %llu: draws %llu passes %llu dispatches %llu", (unsigned long long)ticket, (unsigned long long)atomic_load(&g_stat_draws),
                                              (unsigned long long)atomic_load(&g_stat_passes), (unsigned long long)atomic_load(&g_stat_dispatches));
     if (!V.ok || !V.surface_fn) return ticket;
@@ -565,11 +597,26 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     vk_tex *x = vk_tex_get(t, 0);
     if (g_sub && g_implicit) mtl_sub_commit();   // vk_tex_get may have uploaded through an implicit submission
     if (!x) return ticket;
+    /* Presents do not wait for the GPU: a ring of 8 command buffers / fences, slot i waited for only when it comes round
+       again (its acquire semaphore is reused then too). Waiting for every present serialized the CPU behind the GPU. */
+    static VkCommandPool ppool; static VkCommandBuffer pcb[8]; static VkFence pfence[8];
+    if (!ppool) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, V.qfam};
+        VKCHECK(vkCreateCommandPool(V.dev, &pci, NULL, &ppool));
+        VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, ppool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 8};
+        VKCHECK(vkAllocateCommandBuffers(V.dev, &ai, pcb));
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, VK_FENCE_CREATE_SIGNALED_BIT};
+        for (int i = 0; i < 8; i++) VKCHECK(vkCreateFence(V.dev, &fci, NULL, &pfence[i]));
+    }
     uint32_t fi = V.s_frame++ % 8, idx = 0;
+    vkWaitForFences(V.dev, 1, &pfence[fi], VK_TRUE, UINT64_MAX);
     VkResult r = vkAcquireNextImageKHR(V.dev, V.swap, 1000000000ull, V.s_acq[fi], VK_NULL_HANDLE, &idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_create(); return ticket; }
     if (r < 0) { VKONCE("vkAcquireNextImageKHR: %d", r); return ticket; }
-    VkCommandBuffer cb = vk_oneoff_begin();
+    vkResetFences(V.dev, 1, &pfence[fi]);
+    VkCommandBuffer cb = pcb[fi];
+    VKCHECK(vkResetCommandBuffer(cb, 0));
+    { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHECK(vkBeginCommandBuffer(cb, &bi)); }
     VkImageMemoryBarrier2 b[2] = {
         {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
          VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, 0, 0, x->img, {x->aspect, 0, 1, 0, 1}},
@@ -596,15 +643,11 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkSemaphoreSubmitInfo wsi = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, V.s_acq[fi], 0, VK_PIPELINE_STAGE_2_BLIT_BIT};
     VkSemaphoreSubmitInfo ssi = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, V.s_done[idx], 0, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT};
     VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, 1, &wsi, 1, &cbi, 1, &ssi};
-    VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO}; VkFence f; VKCHECK(vkCreateFence(V.dev, &fci, NULL, &f));
     pthread_mutex_lock(&V.qmu);
-    VKCHECK(vkQueueSubmit2(V.q, 1, &si, f));
+    VKCHECK(vkQueueSubmit2(V.q, 1, &si, pfence[fi]));
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &V.s_done[idx], 1, &V.swap, &idx, NULL};
     r = vkQueuePresentKHR(V.q, &pi);
     pthread_mutex_unlock(&V.qmu);
-    vkWaitForFences(V.dev, 1, &f, VK_TRUE, UINT64_MAX); vkDestroyFence(V.dev, f, NULL);
-    vkFreeCommandBuffers(V.dev, g_oneoff_pool, 1, &cb);
-    pthread_mutex_unlock(&g_oneoff_mu);   // taken by vk_oneoff_begin
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swap_create();
     return ticket;
 }

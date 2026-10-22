@@ -12,7 +12,7 @@
 
 static nvn_vk_resolve_fn g_resolve;
 void nvn_vk_set_resolver(nvn_vk_resolve_fn fn) { g_resolve = fn; }
-static vk_shader *g_shaders; static vk_prog *g_progs;
+static vk_shader *g_shaders;
 static pthread_mutex_t g_shmu = PTHREAD_MUTEX_INITIALIZER;
 
 static char *slurp(const char *path, size_t *n) {
@@ -138,17 +138,24 @@ static void prog_layout(vk_prog *p) {
 
 int vk_rt_variant(int stage, const uint8_t *control, const uint8_t *code, const char *answers, char *path_base, size_t n);
 int vk_exec_answers(int stage, char *buf, size_t n);   // nvn_vk_exec.c: translator answers from the bound state
+uint64_t vk_exec_answer_key(int stage, uint64_t h);   // nvn_vk_exec.c: the same answers, hashed
+/* Programs by (serial, answer key): an open hash table (the replay asks at every draw). */
+#define PROG_HASH 16384
+static vk_prog *g_prog_tab[PROG_HASH];
+static unsigned prog_slot(uint64_t serial, uint64_t akey) { uint64_t h = (serial * 0x9E3779B97F4A7C15ull) ^ akey; return (unsigned)(h ^ (h >> 29)) & (PROG_HASH - 1); }
 vk_prog *vk_prog_get(const prog_t *cp) {
     if (!cp) return NULL;
-    char ans[6][2048]; uint64_t akey = 0;
+    char ans[6][2048]; uint64_t akey = 0; int stages = 0;
     if (!g_resolve) for (unsigned i = 0; i < cp->nstage && i < 6; i++) {
         const uint8_t *control = cp->sd[i].control; if (!control) continue;
         uint32_t st; memcpy(&st, control + 0x714, 4); if (st >= 6) continue;
-        vk_exec_answers((int)st, ans[st], sizeof ans[st]); akey = vk_hash(ans[st], strlen(ans[st]), akey + st + 1);
+        akey = vk_exec_answer_key((int)st, akey + st + 1); stages |= 1 << st;
     }
+    unsigned slot = prog_slot(cp->serial, akey);
     pthread_mutex_lock(&g_shmu);
-    for (vk_prog *p = g_progs; p; p = p->next) if (p->serial == cp->serial && p->akey == akey && cp->serial) { pthread_mutex_unlock(&g_shmu); return p->failed ? NULL : p; }
+    if (cp->serial) for (vk_prog *p = g_prog_tab[slot]; p; p = p->next) if (p->serial == cp->serial && p->akey == akey) { pthread_mutex_unlock(&g_shmu); return p->failed ? NULL : p; }
     pthread_mutex_unlock(&g_shmu);
+    for (int st = 0; st < 6; st++) if (stages & (1 << st)) vk_exec_answers(st, ans[st], sizeof ans[st]);
     vk_prog *p = calloc(1, sizeof *p); p->serial = cp->serial; p->akey = akey;
     for (unsigned i = 0; i < cp->nstage && i < 6; i++) {
         const uint8_t *control = cp->sd[i].control; const uint8_t *code = (const uint8_t *)(uintptr_t)cp->sd[i].data;
@@ -157,11 +164,12 @@ vk_prog *vk_prog_get(const prog_t *cp) {
         if (st != 0 && st != 1 && st != 5) { VKONCE("shader stage %u not supported", st); continue; }
         char base[1024];
         int ok = g_resolve ? g_resolve((int)st, control, code, base, sizeof base) : vk_rt_variant((int)st, control, code, ans[st], base, sizeof base);
+        if (ok == 2) { free(p); return NULL; }   // being translated in the background: skip the draw, ask again next time
         if (ok) p->sh[st] = vk_shader_load(base, (int)st);
         if (!ok || !p->sh[st]) { p->failed = 1; break; }
     }
     if (!p->failed) prog_layout(p);
-    pthread_mutex_lock(&g_shmu); p->next = g_progs; g_progs = p; pthread_mutex_unlock(&g_shmu);
+    pthread_mutex_lock(&g_shmu); p->next = g_prog_tab[slot]; g_prog_tab[slot] = p; pthread_mutex_unlock(&g_shmu);
     return p->failed ? NULL : p;
 }
 void mtl_prog_release(prog_t *p) { (void)p; /* programs are keyed by serial; variants are shared and kept */ }
