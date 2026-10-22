@@ -36,8 +36,9 @@ static bool env_on(const char *name) {
     const char *o = getenv("TOTK_SLOT_OWNER");
     return !(o && (!strcmp(o, "claude") || !strcmp(o, "codex")));
 }
-int runtime_rumble_enabled(void) { return env_on("TOTK_RUMBLE"); }
-int runtime_gyro_enabled(void) { return env_on("TOTK_GYRO"); }
+/* Read once: whether the game got the device at start (the in-game menu changes the variables later, then mutes / unmutes). */
+int runtime_rumble_enabled(void) { static int v = -1; if (v < 0) v = env_on("TOTK_RUMBLE"); return v; }
+int runtime_gyro_enabled(void) { static int v = -1; if (v < 0) v = env_on("TOTK_GYRO"); return v; }
 static _Atomic int rumble_muted, gyro_muted;
 static pthread_mutex_t lastLock = PTHREAD_MUTEX_INITIALIZER;
 static VibrationValue last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   /* lastLock */
