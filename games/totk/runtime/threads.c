@@ -76,10 +76,11 @@ typedef struct thr {
     uint32_t wh[4]; int nwh;   // handles of the current WaitSynchronization (state dump)
     int last_hle;              // 1 + wrapper index of the last host call made while "hletrace" was on (state dump)
     uint64_t yrun_ns, yrun_svc;   // the current run of yields: when it started, and nsvc at its last yield (yield_backoff_ns)
+    uint64_t wake_ns;             // TOTK_SCHED_STATS: when wake() ran (for the wake-up latency)
 #ifdef GAME_BOTW
     uint64_t cwait_ns;            // when it last queued for a virtual core (starvation rule, core_beats)
     uint64_t protect_until;       // given a core by the starvation rule: no priority preemption before this
-    int cqueued;                  // in g_core_wait: queued by core_take, or by wake_queue the moment it was woken
+    int cqueued;                 // in g_core_wait: queued by core_take, or by wake_queue the moment it was woken
 #endif
 } thr_t;
 static thr_t *g_all;
@@ -166,7 +167,9 @@ static thr_t *pick(int kind, uint64_t a) {
 #ifdef GAME_BOTW
 static void wake_queue(thr_t *t);   /* below, with the virtual cores */
 #endif
-static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; pthread_cond_signal(&t->cv);
+static uint64_t sched_now(void);
+static int sched_stats_on(void);
+static void wake(thr_t *t, int64_t res) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; if (sched_stats_on()) t->wake_ns = sched_now(); pthread_cond_signal(&t->cv);
 #ifdef GAME_BOTW
     wake_queue(t);
 #endif
@@ -403,9 +406,39 @@ void runtime_core_checkpoint(void) {
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? (t->cur_core >= 0 ? t->cur_core : t->core) : -1; }
 
+/* TOTK_SCHED_STATS=1 (diagnostics): per wait kind (1 mutex, 2 condition variable, 3 address arbiter, 4 synchronization
+   objects) the waits, the time blocked, the wake-up latency (wake() to the thread running again) and the time spent
+   getting a virtual core back afterwards; logged every 5 s. Counted holding G. */
+static uint64_t sched_now(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+static int sched_stats_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_SCHED_STATS"); on = e && *e && strcmp(e, "0"); } return on; }
+static struct { uint64_t n, woken, blocked_ns, wake_lat_ns, wake_lat_max, core_ns; } g_sst[5];
+static uint64_t g_sst_since;
+static void sched_stats_report(uint64_t now) {
+    if (!g_sst_since) { g_sst_since = now; return; }
+    if (now - g_sst_since < 5000000000ull) return;
+    double sec = (now - g_sst_since) / 1e9;
+    static const char *names[5] = {"other", "mutex", "condvar", "arbiter", "sync"};
+    for (int k = 0; k < 5; k++) {
+        if (!g_sst[k].n) continue;
+        fprintf(stderr, "[sched] %-8s %7.0f waits/s, blocked %6.1f ms/s, woken %7.0f/s with wake latency %6.1f us avg %7.1f us max, core reacquire %6.1f ms/s\n",
+                names[k], g_sst[k].n / sec, g_sst[k].blocked_ns / 1e6 / sec, g_sst[k].woken / sec,
+                g_sst[k].woken ? g_sst[k].wake_lat_ns / 1e3 / g_sst[k].woken : 0.0, g_sst[k].wake_lat_max / 1e3, g_sst[k].core_ns / 1e6 / sec);
+    }
+    memset(g_sst, 0, sizeof g_sst); g_sst_since = now;
+}
 static int64_t block(thr_t *t,int kind,int64_t ns) {
     if (ns == 0) return block_inner(t, kind, ns);
-    core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r;
+    if (!sched_stats_on()) { core_put(t); int64_t r = block_inner(t, kind, ns); core_take(t); return r; }
+    int k = kind >= 1 && kind <= 4 ? kind : 0;
+    uint64_t t0 = sched_now(); t->wake_ns = 0;
+    core_put(t); int64_t r = block_inner(t, kind, ns);
+    uint64_t t1 = sched_now();
+    core_take(t);
+    uint64_t t2 = sched_now();
+    g_sst[k].n++; g_sst[k].blocked_ns += t1 - t0; g_sst[k].core_ns += t2 - t1;
+    if (t->wake_ns && t->wake_ns <= t1) { uint64_t lat = t1 - t->wake_ns; g_sst[k].woken++; g_sst[k].wake_lat_ns += lat; if (lat > g_sst[k].wake_lat_max) g_sst[k].wake_lat_max = lat; }
+    sched_stats_report(t2);
+    return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
