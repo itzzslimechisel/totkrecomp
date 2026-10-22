@@ -15,6 +15,7 @@
 vk_dev V;
 _Atomic uint64_t g_done;
 _Atomic uint64_t g_stat_draws, g_stat_passes, g_stat_dispatches, g_stat_uploads, g_stat_upload_bytes, g_stat_readback_bytes;
+_Atomic uint64_t g_stat_skip_shader, g_stat_skip_pipe;
 _Thread_local vk_sub *g_sub;
 static pthread_mutex_t g_big;   // recursive: GPU recording (replay thread for a whole submission; present / texel access otherwise)
 static int g_big_init;
@@ -587,8 +588,21 @@ uint64_t mtl_present(const tex_t *t, double period_s, const int crop[4]) {
 static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     present_shot(t, ticket);
     { void vk_pcache_tick(uint64_t); vk_pcache_tick(ticket); }
+    { void vk_pipe_budget_reset(void); vk_pipe_budget_reset(); }
     if (ticket % 600 == 0) { void vk_pipe_stats(uint64_t *, uint64_t *, int *); uint64_t made, ns; int pend; vk_pipe_stats(&made, &ns, &pend);
         VKLOG("pipelines: %llu created (%.1f ms average, on worker threads), %d being created", (unsigned long long)made, made ? ns / 1e6 / made : 0.0, pend); }
+    {   /* draws skipped because a shader variant or pipeline was not ready: per 60 presents, when there were any */
+        static uint64_t last_s, last_p, prev_s, prev_p, frames_with;
+        uint64_t s = atomic_load(&g_stat_skip_shader), p = atomic_load(&g_stat_skip_pipe);
+        if (s != prev_s || p != prev_p) frames_with++;
+        prev_s = s; prev_p = p;
+        if (ticket % 60 == 0 && frames_with) {
+            VKLOG("draws skipped in the last 60 presents (%llu of them): shader not ready %llu, pipeline not ready %llu (total %llu / %llu)", (unsigned long long)frames_with,
+                  (unsigned long long)(s - last_s), (unsigned long long)(p - last_p), (unsigned long long)s, (unsigned long long)p);
+            frames_with = 0;
+        }
+        if (ticket % 60 == 0) { last_s = s; last_p = p; }
+    }
     if (ticket == 1 || ticket % 600 == 0) VKLOG("present %llu: draws %llu passes %llu dispatches %llu", (unsigned long long)ticket, (unsigned long long)atomic_load(&g_stat_draws),
                                              (unsigned long long)atomic_load(&g_stat_passes), (unsigned long long)atomic_load(&g_stat_dispatches));
     if (!V.ok || !V.surface_fn) return ticket;

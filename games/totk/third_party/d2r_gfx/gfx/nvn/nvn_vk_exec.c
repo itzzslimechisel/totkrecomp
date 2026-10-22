@@ -259,11 +259,27 @@ static vk_pipe2 *pipe_find(vk_prog *pr, const pso_key *k, uint64_t h) {
     for (vk_pipe2 *p = (vk_pipe2 *)__atomic_load_n(&pr->pipes, __ATOMIC_ACQUIRE); p; p = p->next) if (p->h == h && !memcmp(&p->k, k, sizeof *k)) return p;
     return NULL;
 }
+/* Per-frame budget for creating pipelines on the submitting thread: a pipeline the driver has in its cache takes well
+   under a millisecond, so most new ones are made in place and their draw is not skipped. Past the budget (a new area
+   with thousands of new pipelines) they go to the workers and their draws are skipped until ready. TOTK_PIPE_BUDGET_MS
+   (default 8; 0 = always on the workers). vk_pipe_budget_reset() is called at each present. */
+static _Atomic uint64_t g_budget_used_ns;
+static uint64_t pipe_budget_ns(void) {
+    static int64_t b = -1;
+    if (b < 0) { const char *e = getenv("TOTK_PIPE_BUDGET_MS"); double ms = e && *e ? atof(e) : 8.0; b = ms > 0 ? (int64_t)(ms * 1e6) : 0; }
+    return (uint64_t)b;
+}
+static int pipe_budget_take(void) { return atomic_load(&g_budget_used_ns) < pipe_budget_ns(); }
+void vk_pipe_budget_reset(void) { atomic_store(&g_budget_used_ns, 0); }
 /* Returns the pipeline, or VK_NULL_HANDLE (being created / failed: skip the draw). */
 static VkPipeline pipe_submit(vk_prog *pr, const pso_key *k, uint64_t h, pipe_job *j) {
     vk_pipe2 *np = calloc(1, sizeof *np); np->k = *k; np->h = h; j->dst = (struct vk_pipe *)np;
     if (j->compute) j->cci.layout = pr->layout; else j->gci.layout = pr->layout;
-    if (shader_sync()) { VkPipeline p = pipe_create(j); atomic_store(&np->p, p); atomic_store(&np->state, p ? 1 : 2); free(j); }
+    if (shader_sync() || pipe_budget_take()) {
+        uint64_t t0 = vk_now_ns();
+        VkPipeline p = pipe_create(j); atomic_store(&np->p, p); atomic_store(&np->state, p ? 1 : 2); free(j);
+        atomic_fetch_add(&g_budget_used_ns, vk_now_ns() - t0);
+    }
     else {
         static int workers; pjq *q = malloc(sizeof *q); q->j = j; q->next = NULL;
         pthread_mutex_lock(&g_pipe_mu);
@@ -287,8 +303,13 @@ static VkPipeline pso_get(vk_prog *pr, VkPrimitiveTopology topo) {
     k.topo = (uint8_t)topo; k.offset_en = (uint8_t)S.poly.offset_en;
     k.ds = S.ds;
     vk_shader *vs = pr->sh[0];
-    for (int i = 0; vs && i < vs->nv; i++) { int loc = vs->v[i].loc; k.vattr[i] = loc < S.nattr || loc < 16 ? S.attr[loc & 15] : 0; }
-    for (int i = 0; i < 16; i++) { k.vstride[i] = S.stream[i].stride; k.vdiv[i] = S.stream[i].divisor; }
+    uint32_t streams = 0;   /* only the streams this vertex shader reads: the strides of other bound streams must not split the key */
+    for (int i = 0; vs && i < vs->nv; i++) {
+        int loc = vs->v[i].loc; k.vattr[i] = loc < S.nattr || loc < 16 ? S.attr[loc & 15] : 0;
+        va_st a; uint32_t raw = S.attr[loc & 15]; memcpy(&a, &raw, 4);
+        if (loc < 16 && a.fmt) streams |= 1u << (a.stream & 15);
+    }
+    for (int i = 0; i < 16; i++) if (streams & (1u << i)) { k.vstride[i] = S.stream[i].stride; k.vdiv[i] = S.stream[i].divisor; }
     uint64_t h = key_hash(&k);
     vk_pipe2 *found = pipe_find(pr, &k, h);
     if (found) return atomic_load(&found->p);
@@ -481,13 +502,13 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     int count = dw ? dw->count : di->count;
     if (count <= 0) return;
     vk_prog *pr = vk_prog_get(S.prog);
-    if (!pr || !pr->sh[0]) { VKONCE("draw skipped: program without a vertex shader variant"); return; }
+    if (!pr || !pr->sh[0]) { VKONCE("draw skipped: program without a vertex shader variant"); atomic_fetch_add(&g_stat_skip_shader, 1); return; }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) return;
     if (!rt_has_any() && !S.has_vp && !R.has_sc) { VKONCE("draw without render targets or viewport skipped"); return; }
     pass_begin();
     VkCommandBuffer cb = CB();
     int quads; VkPrimitiveTopology topo = topo_of(dw ? dw->prim : di->prim, &quads);
-    VkPipeline pipe = pso_get(pr, topo); if (!pipe) return;
+    VkPipeline pipe = pso_get(pr, topo); if (!pipe) { atomic_fetch_add(&g_stat_skip_pipe, 1); return; }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     bind_descriptors(pr, VK_PIPELINE_BIND_POINT_GRAPHICS);
     // dynamic state

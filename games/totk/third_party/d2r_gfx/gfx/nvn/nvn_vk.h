@@ -170,6 +170,7 @@ const char *nvn_vk_translator_caps(void);
 // ---------- misc ----------
 uint64_t vk_hash(const void *p, size_t n, uint64_t h);
 extern _Atomic uint64_t g_stat_draws, g_stat_passes, g_stat_dispatches, g_stat_uploads, g_stat_upload_bytes, g_stat_readback_bytes;
+extern _Atomic uint64_t g_stat_skip_shader, g_stat_skip_pipe;   /* draws skipped: shader variant / pipeline not ready yet */
 
 // Test / diagnostics API (also used by tests/gfx_vk)
 int nvn_vk_available(void);        // device initialized (mtl_init called) and usable
