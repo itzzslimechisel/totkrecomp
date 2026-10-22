@@ -11,6 +11,7 @@
 #include <SDL3/SDL.h>
 #include <pthread.h>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -43,6 +44,13 @@ VkImageView g_views[8];
 VkDevice g_dev;
 int g_fpsMode = -1;          /* 0 off, 1 FPS, 2 FPS + frame time */
 std::atomic<bool> g_confirmQuit{false};   /* main thread (B) and render thread */
+/* Window actions asked for by the render thread (menu items) and done by the SDL main thread (overlay_main_tick). */
+enum { REQ_TOGGLE = 1, REQ_FULLSCREEN = 2, REQ_WINSIZE = 4 };
+std::atomic<int> g_req{0}, g_reqFullscreen{0};
+std::atomic<bool> g_fullscreen{false};    /* the window's state, kept by the main thread */
+std::atomic<bool> g_swapRecreate{false};  /* VSync changed: the backend makes a new swapchain after this present */
+void request_main(int what, int value) { if (what == REQ_FULLSCREEN) g_reqFullscreen = value; g_req.fetch_or(what); }
+void request_toggle() { request_main(REQ_TOGGLE, 0); }
 uint64_t g_lastNs, g_accNs; int g_accFrames; float g_fps, g_ms;
 
 int fps_mode_setting() {
@@ -79,6 +87,18 @@ extern "C" void overlay_toggle(void) {
     fprintf(stderr, "[totk-menu] %s\n", open ? "opened (game input held)" : "closed");
 }
 
+extern "C" void overlay_main_tick(void) {   /* SDL main thread, each loop */
+    if (!g_win) return;
+    g_fullscreen = (SDL_GetWindowFlags(g_win) & SDL_WINDOW_FULLSCREEN) != 0;
+    int r = g_req.exchange(0);
+    if (r & REQ_TOGGLE) overlay_toggle();
+    if (r & REQ_FULLSCREEN) { SDL_SetWindowFullscreen(g_win, g_reqFullscreen.load() != 0); g_fullscreen = g_reqFullscreen.load() != 0; }
+    if ((r & REQ_WINSIZE) && !g_fullscreen) {
+        const char *e = getenv("TOTK_WINDOW_SIZE"); int w = 0, h = 0;
+        if (e && sscanf(e, "%dx%d", &w, &h) == 2 && w >= 320 && h >= 180) { SDL_SetWindowSize(g_win, w, h); SDL_SetWindowPosition(g_win, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED); }
+    }
+}
+
 extern "C" int overlay_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
@@ -103,6 +123,8 @@ extern "C" int overlay_event(const SDL_Event *e) {
             case SDL_GAMEPAD_BUTTON_DPAD_LEFT: push_key(SDLK_LEFT, SDL_SCANCODE_LEFT, down); break;
             case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: push_key(SDLK_RIGHT, SDL_SCANCODE_RIGHT, down); break;
             case SDL_GAMEPAD_BUTTON_SOUTH: push_key(SDLK_RETURN, SDL_SCANCODE_RETURN, down); break;
+            case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: push_key(SDLK_PAGEUP, SDL_SCANCODE_PAGEUP, down); break;      /* LB / RB: tabs */
+            case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: push_key(SDLK_PAGEDOWN, SDL_SCANCODE_PAGEDOWN, down); break;
             case SDL_GAMEPAD_BUTTON_EAST: if (down) { if (g_confirmQuit) g_confirmQuit = false; else overlay_toggle(); } break;
             default: break;
             }
@@ -156,12 +178,73 @@ static void set_fps_mode(int m) {
     settings_ini_set("TOTK_FPS_OVERLAY", m == 2 ? "full" : m == 1 ? "fps" : "0");
 }
 
+/* ---------- settings rows ---------- */
+static std::string env(const char *k) { const char *v = getenv(k); return v ? v : ""; }
+struct Choice { const char *label, *value; };
+static int choice_index(const Choice *c, int n, const std::string &cur) { for (int i = 0; i < n; i++) if (cur == c[i].value) return i; return -1; }
+
+/* A row of a tab: a button (activate) or a value cycled with Left / Right / Enter (change(+1 / -1)). */
+struct Row {
+    std::string label, value;
+    bool next_start = false;              /* applied the next time the game starts */
+    std::function<void(int)> change;      /* value rows */
+    std::function<void()> activate;       /* button rows */
+};
+
+static const Choice kSizes[] = {{"1280 x 720", "1280x720"}, {"1600 x 900", "1600x900"}, {"1920 x 1080", "1920x1080"}, {"2560 x 1440", "2560x1440"}, {"3840 x 2160", "3840x2160"}};
+static const Choice kRender[] = {{"Game default", ""}, {"1280 x 720", "1280x720"}, {"1600 x 900", "1600x900"}, {"1920 x 1080", "1920x1080"}, {"2560 x 1440", "2560x1440"}};
+static const char *kFpsModes[] = {"Off", "FPS", "FPS + frame time"};
+
+/* FPS target: 30 = the game's original pacing (TOTK_FPS60=0); otherwise the 60 FPS patch with a cap (TOTK_UNCAPPED_HZ). */
+static int fps_target_index() {
+    if (env("TOTK_FPS60") == "0") return 0;
+    std::string hz = env("TOTK_UNCAPPED_HZ");
+    return hz == "60" ? 1 : hz == "120" ? 2 : 3;
+}
+static void set_fps_target(int i) {
+    settings_ini_set("TOTK_FPS60", i == 0 ? "0" : nullptr);
+    settings_ini_set("TOTK_UNCAPPED_HZ", i == 1 ? "60" : i == 2 ? "120" : nullptr);
+}
+
+static std::vector<Row> tab_rows(int tab) {
+    std::vector<Row> r;
+    if (tab == 0) {   /* Game */
+        Row resume; resume.label = "Resume"; resume.activate = [] { request_toggle(); }; r.push_back(resume);
+        Row quit; quit.label = "Quit game..."; quit.activate = [] { g_confirmQuit = true; }; r.push_back(quit);
+    } else if (tab == 1) {   /* Video */
+        Row fs; fs.label = "Fullscreen"; fs.value = g_fullscreen ? "On" : "Off";
+        fs.change = [](int) { bool on = !g_fullscreen; settings_ini_set("TOTK_FULLSCREEN", on ? "1" : nullptr); request_main(REQ_FULLSCREEN, on); };
+        r.push_back(fs);
+        Row ws; ws.label = "Window size"; { std::string cur = env("TOTK_WINDOW_SIZE"); if (cur.empty()) cur = "1920x1080"; int i = choice_index(kSizes, 5, cur); ws.value = i >= 0 ? kSizes[i].label : cur; }
+        ws.change = [](int d) { int i = choice_index(kSizes, 5, env("TOTK_WINDOW_SIZE").empty() ? "1920x1080" : env("TOTK_WINDOW_SIZE")); i = ((i < 0 ? 2 : i) + d + 5) % 5;
+                                settings_ini_set("TOTK_WINDOW_SIZE", kSizes[i].value); request_main(REQ_WINSIZE, 1); };
+        r.push_back(ws);
+        Row vs; vs.label = "VSync"; vs.value = env("TOTK_VK_VSYNC_OFF") == "1" ? "Off" : "On";
+        vs.change = [](int) { bool off = env("TOTK_VK_VSYNC_OFF") != "1"; settings_ini_set("TOTK_VK_VSYNC_OFF", off ? "1" : nullptr); g_swapRecreate = true; };
+        r.push_back(vs);
+        Row rr; rr.label = "Render resolution"; rr.next_start = true; { int i = choice_index(kRender, 5, env("TOTK_RENDER_RES")); rr.value = i >= 0 ? kRender[i].label : env("TOTK_RENDER_RES"); }
+        rr.change = [](int d) { int i = choice_index(kRender, 5, env("TOTK_RENDER_RES")); i = ((i < 0 ? 0 : i) + d + 5) % 5; settings_ini_set("TOTK_RENDER_RES", kRender[i].value[0] ? kRender[i].value : nullptr); };
+        r.push_back(rr);
+        static const char *targets[] = {"30 (original)", "60", "120", "Display refresh"};
+        Row ft; ft.label = "FPS target"; ft.next_start = true; ft.value = targets[fps_target_index()];
+        ft.change = [](int d) { set_fps_target((fps_target_index() + d + 4) % 4); };
+        r.push_back(ft);
+        Row fc; fc.label = "FPS counter"; fc.value = kFpsModes[g_fpsMode < 0 ? 0 : g_fpsMode];
+        fc.change = [](int d) { set_fps_mode((g_fpsMode + d + 3) % 3); };
+        r.push_back(fc);
+    }
+    return r;
+}
+
+/* ---------- navigation ---------- */
 /* Keyboard / controller navigation of our own (a selected row, drawn highlighted): Up / Down move, Left / Right change a
-   value, Enter / A activates. The mouse works through ImGui as usual. */
-enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK };
+   value (on the top row: the tab), Enter / A activates, Q / E or LB / RB switch tabs. The mouse works through ImGui. */
+enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_TAB_PREV, NAV_TAB_NEXT };
 static std::vector<int> g_nav;
-static int g_sel;
+static int g_sel, g_tab;
 static bool g_mouseMoved; static ImVec2 g_mouseAtOpen(-1, -1);
+static const char *kTabs[] = {"Game", "Video"};
+static const int kNumTabs = 2;
 static bool nav_key(const SDL_Event &e) {   /* render thread: true if the key is ours */
     if (e.type != SDL_EVENT_KEY_DOWN && e.type != SDL_EVENT_KEY_UP) return false;
     int a = -1;
@@ -169,6 +252,7 @@ static bool nav_key(const SDL_Event &e) {   /* render thread: true if the key is
     case SDL_SCANCODE_UP: case SDL_SCANCODE_KP_8: a = NAV_UP; break; case SDL_SCANCODE_DOWN: case SDL_SCANCODE_KP_2: a = NAV_DOWN; break;   /* keypad arrows too */
     case SDL_SCANCODE_LEFT: case SDL_SCANCODE_KP_4: a = NAV_LEFT; break; case SDL_SCANCODE_RIGHT: case SDL_SCANCODE_KP_6: a = NAV_RIGHT; break;
     case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: case SDL_SCANCODE_SPACE: a = NAV_OK; break;
+    case SDL_SCANCODE_Q: case SDL_SCANCODE_PAGEUP: a = NAV_TAB_PREV; break; case SDL_SCANCODE_E: case SDL_SCANCODE_PAGEDOWN: a = NAV_TAB_NEXT; break;
     default: return false;
     }
     if (e.type == SDL_EVENT_KEY_DOWN) g_nav.push_back(a);
@@ -193,46 +277,67 @@ static void menu_window() {
     if (wasConfirm != g_confirmQuit) { g_sel = g_confirmQuit ? 1 : 0; wasConfirm = g_confirmQuit; }   /* the dialog opens on Cancel */
     if (g_mouseAtOpen.x < 0 && ImGui::IsMousePosValid()) g_mouseAtOpen = io.MousePos;
     if (!g_mouseMoved && g_mouseAtOpen.x >= 0 && (fabsf(io.MousePos.x - g_mouseAtOpen.x) + fabsf(io.MousePos.y - g_mouseAtOpen.y)) > 6) g_mouseMoved = true;
-    const int rows = g_confirmQuit ? 2 : 3;
+    std::vector<Row> rows = tab_rows(g_tab);
+    const int n = g_confirmQuit ? 2 : (int)rows.size() + 1;   /* row 0 = the tab selector */
     for (int a : g_nav) {
         if (g_confirmQuit) {
             if (a == NAV_UP || a == NAV_DOWN || a == NAV_LEFT || a == NAV_RIGHT) g_sel = 1 - g_sel;
             else if (a == NAV_OK) { if (g_sel == 0) quit_game(); else g_confirmQuit = false; }
-        } else {
-            if (a == NAV_UP) g_sel = (g_sel + rows - 1) % rows;
-            else if (a == NAV_DOWN) g_sel = (g_sel + 1) % rows;
-            else if (g_sel == 1 && (a == NAV_LEFT || a == NAV_RIGHT || a == NAV_OK)) set_fps_mode((g_fpsMode + (a == NAV_LEFT ? 2 : 1)) % 3);
-            else if (a == NAV_OK && g_sel == 0) overlay_toggle();
-            else if (a == NAV_OK && g_sel == 2) g_confirmQuit = true;
+            continue;
+        }
+        if (a == NAV_TAB_PREV || a == NAV_TAB_NEXT || (g_sel == 0 && (a == NAV_LEFT || a == NAV_RIGHT))) {
+            g_tab = (g_tab + (a == NAV_TAB_PREV || a == NAV_LEFT ? kNumTabs - 1 : 1)) % kNumTabs; g_sel = 0; rows = tab_rows(g_tab); continue;
+        }
+        if (a == NAV_UP) g_sel = (g_sel + n - 1) % n;
+        else if (a == NAV_DOWN) g_sel = (g_sel + 1) % n;
+        else if (g_sel > 0 && g_sel <= (int)rows.size()) {
+            Row &r = rows[g_sel - 1];
+            if (r.change && (a == NAV_LEFT || a == NAV_RIGHT || a == NAV_OK)) r.change(a == NAV_LEFT ? -1 : 1);
+            else if (r.activate && a == NAV_OK) r.activate();
+            rows = tab_rows(g_tab);
         }
     }
     g_nav.clear();
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 140));
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.y * 0.62f, 0));
+    ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.y * 0.75f, 0));
     ImGui::Begin("Tears of the Kingdom", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
     float w = ImGui::GetContentRegionAvail().x;
-    if (!g_confirmQuit) {
-        if (row_button("Resume", 0, w)) overlay_toggle();
-        ImGui::Spacing();
-        ImGui::SeparatorText("Display");
-        static const char *modes[] = {"Off", "FPS", "FPS + frame time"};
-        char label[64]; snprintf(label, sizeof label, "FPS counter:  <  %s  >", modes[g_fpsMode]);
-        if (row_button(label, 1, w)) set_fps_mode((g_fpsMode + 1) % 3);
-        ImGui::Spacing();
-        ImGui::Separator();
-        if (row_button("Quit game...", 2, w)) g_confirmQuit = true;
-        ImGui::Spacing();
-        ImGui::TextDisabled("F1 / Esc or Minus + Plus: back to the game");
-        ImGui::TextDisabled("Arrows / D-pad: move   Enter / A: choose   B: back");
-    } else {
+    if (g_confirmQuit) {
         ImGui::TextWrapped("Quit the game? Progress since the last save is lost. A save that is being written finishes first.");
         ImGui::Spacing();
         if (row_button("Quit", 0, w * 0.48f)) quit_game();
         ImGui::SameLine();
         if (row_button("Cancel", 1, ImGui::GetContentRegionAvail().x)) g_confirmQuit = false;
+        ImGui::End();
+        return;
     }
+    /* tab selector (row 0) */
+    float tw = (w - ImGui::GetStyle().ItemSpacing.x * (kNumTabs - 1)) / kNumTabs;
+    for (int t = 0; t < kNumTabs; t++) {
+        if (t) ImGui::SameLine();
+        bool cur = t == g_tab;
+        if (cur) ImGui::PushStyleColor(ImGuiCol_Button, g_sel == 0 ? ImVec4(0.30f, 0.52f, 0.95f, 1) : ImVec4(0.24f, 0.36f, 0.62f, 1));
+        if (cur && g_sel == 0) { ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(1, 1, 1, 0.9f)); ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 2); }
+        if (ImGui::Button(kTabs[t], ImVec2(tw, 0))) { g_tab = t; g_sel = 0; rows = tab_rows(g_tab); }
+        if (cur && g_sel == 0) { ImGui::PopStyleVar(); ImGui::PopStyleColor(); }
+        if (cur) ImGui::PopStyleColor();
+    }
+    ImGui::Separator();
+    bool anyNext = false;
+    for (int i = 0; i < (int)rows.size(); i++) {
+        Row &r = rows[i];
+        char label[160];
+        if (r.change) snprintf(label, sizeof label, "%s:   <  %s  >%s", r.label.c_str(), r.value.c_str(), r.next_start ? "  *" : "");
+        else snprintf(label, sizeof label, "%s", r.label.c_str());
+        if (row_button(label, i + 1, w)) { if (r.change) r.change(+1); else if (r.activate) r.activate(); }
+        anyNext |= r.next_start;
+    }
+    ImGui::Spacing();
+    if (anyNext) ImGui::TextDisabled("* applies the next time the game starts");
+    ImGui::TextDisabled("F1 / Esc or Minus + Plus: back to the game");
+    ImGui::TextDisabled("Arrows / D-pad: move   Left / Right: change   Enter / A: choose   B: back   Q / E or LB / RB: tabs");
     ImGui::End();
 }
 
@@ -250,7 +355,7 @@ extern "C" int overlay_vk_draw(const overlay_vk_frame *f) {
     if (g_accNs >= 500000000ull) { g_fps = g_accFrames * 1e9f / g_accNs; g_ms = g_accNs / 1e6f / g_accFrames; g_accNs = 0; g_accFrames = 0; }
     if (g_fpsMode < 0) g_fpsMode = fps_mode_setting();
     bool open = g_open.load();
-    { static bool was; if (open && !was) { g_sel = 0; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
+    { static bool was; if (open && !was) { g_sel = 1; g_tab = 0; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
     if (!open) { std::lock_guard<std::mutex> l(g_qmu); g_q.clear(); g_confirmQuit = false; }
     if (!g_win || (!open && !g_fpsMode) || f->image_index >= 8) return 0;
     if (!g_ready) { if (!init_imgui(f)) { g_win = nullptr; fprintf(stderr, "[totk-menu] initialization failed: menu off\n"); return 0; } g_ready = true; }
@@ -301,5 +406,5 @@ extern "C" int overlay_vk_draw(const overlay_vk_frame *f) {
     vkCmdEndRendering(cb);
     barrier(cb, img, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    return 1;
+    return g_swapRecreate.exchange(false) ? 3 : 1;
 }

@@ -641,7 +641,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     if (r == VK_ERROR_OUT_OF_DATE_KHR) { swap_create(); return ticket; }
     if (r < 0) { VKONCE("vkAcquireNextImageKHR: %d", r); return ticket; }
     vkResetFences(V.dev, 1, &pfence[fi]);
-    VkCommandBuffer cb = pcb[fi];
+    VkCommandBuffer cb = pcb[fi]; int swap_reset = 0;
     VKCHECK(vkResetCommandBuffer(cb, 0));
     { VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT}; VKCHECK(vkBeginCommandBuffer(cb, &bi)); }
     VkImageMemoryBarrier2 b[2] = {
@@ -663,7 +663,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     vkCmdBlitImage(cb, x->img, VK_IMAGE_LAYOUT_GENERAL, V.simg[idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
     if (overlay_vk_draw) {   /* the in-game menu / FPS counter (runtime/overlay), drawn last; the image is TRANSFER_DST again after it */
         overlay_vk_frame of = {V.inst, V.phys, V.dev, V.q, &V.qmu, V.qfam, V.nsimg, idx, cb, V.simg[idx], (uint32_t)V.sfmt, V.sext.width, V.sext.height, g_swap_gen};
-        overlay_vk_draw(&of);
+        if (overlay_vk_draw(&of) & 2) swap_reset = 1;
     }
     VkBuffer obuf = VK_NULL_HANDLE; VmaAllocation oal = NULL; VmaAllocationInfo oinf = {0};
     if (atomic_exchange(&g_oshot_pending, 0)) {   /* "oshot": copy the finished swapchain image out (read after the fence below) */
@@ -705,7 +705,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
         else VKLOG("screenshot with overlay %s failed", p);
         vmaDestroyBuffer(V.vma, obuf, oal);
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swap_create();
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR || swap_reset) swap_create();   /* swap_reset: VSync changed in the menu */
     return ticket;
 }
 void mtl_present_wait(uint64_t ticket) { (void)ticket; }
