@@ -171,7 +171,7 @@ static void pass_begin(void) {
         unsigned lv = v && v->set_levels ? v->base_level : 0;
         uint32_t aw = mipd(x->w, lv), ah = mipd(x->h, lv); if (aw < w) w = aw; if (ah < h) h = ah;
         uint32_t al = v && v->set_layers && v->nlayers ? v->nlayers : (x->type == VK_IMAGE_TYPE_3D ? mipd(x->d, lv) : x->layers);
-        if (!(v && v->set_layers)) al = 1;
+        if (!(v && v->set_layers) && x->type != VK_IMAGE_TYPE_3D) al = 1;   // a 3D target without a view: every slice (layered draw)
         if (al > 1 && (!any || al < layers)) layers = al;
         ca[i].imageView = iv; ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL; ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         P.cfmt[i] = v && v->set_format && !x->decoded && vk_format_of(v->format) ? vk_format_of(v->format) : x->fmt;

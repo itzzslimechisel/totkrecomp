@@ -190,6 +190,8 @@ static vk_tex *tex_create(const tex_t *t) {
         if ((d->flags & NVN_TEXTURE_FLAGS_IMAGE) && (ff & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) && x->samples == VK_SAMPLE_COUNT_1_BIT) us |= VK_IMAGE_USAGE_STORAGE_BIT;
     } else fl |= VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
     if (x->type == VK_IMAGE_TYPE_3D) fl &= ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    /* A 3D render target (the colour-grading LUT behind the menus) is drawn slice by slice through 2D-array views */
+    if (x->type == VK_IMAGE_TYPE_3D && (us & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) fl |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
     uint32_t maxdim = x->w > x->h ? x->w : x->h; if (x->d > maxdim) maxdim = x->d;
     uint32_t maxlv = 1; while ((maxdim >> maxlv) > 0) maxlv++;
     if (x->levels > maxlv) x->levels = maxlv;
@@ -269,8 +271,14 @@ VkImageView vk_tex_view_typed(vk_tex *x, const view_t *v, int has_v, VkImageView
     uint32_t l0 = has_v && v->set_layers ? v->min_layer : 0, nly = has_v && v->set_layers && v->nlayers ? v->nlayers : x->layers - l0;
     if (base >= x->levels) base = x->levels - 1;
     if (base + nl > x->levels) nl = x->levels - base;
-    if (l0 >= x->layers) l0 = x->layers - 1;
-    if (l0 + nly > x->layers) nly = x->layers - l0;
+    /* A 3D image attached as a render target: its slices are the layers of the 2D-array view (x->layers is 1) */
+    uint32_t nslice = x->layers;
+    if (x->type == VK_IMAGE_TYPE_3D && usage == 2) {
+        nslice = x->d >> base ? x->d >> base : 1;
+        if (!(has_v && v->set_layers && v->nlayers)) nly = nslice - (l0 < nslice ? l0 : nslice - 1);
+    }
+    if (l0 >= nslice) l0 = nslice - 1;
+    if (l0 + nly > nslice) nly = nslice - l0;
     VkFormat f = x->fmt;
     if (has_v && v->set_format && !x->decoded) { VkFormat vf = vk_format_of(v->format); if (vf) f = vf; }
     int target = has_v && v->set_target ? v->target : x->t.d.target;
