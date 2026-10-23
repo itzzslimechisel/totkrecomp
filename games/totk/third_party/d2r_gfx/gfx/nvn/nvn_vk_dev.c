@@ -695,6 +695,7 @@ static uint64_t present_(const tex_t *t, const int crop[4], uint64_t ticket) {
     VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, NULL, 1, &V.s_done[idx], 1, &V.swap, &idx, NULL};
     r = vkQueuePresentKHR(V.q, &pi);
     pthread_mutex_unlock(&V.qmu);
+    { extern void front_frame_presented(void) __attribute__((weak)); if (front_frame_presented) front_frame_presented(); }   // clears the boot status in the title
     if (obuf) {
         vkWaitForFences(V.dev, 1, &pfence[fi], VK_TRUE, UINT64_MAX);
         uint8_t *px = oinf.pMappedData; size_t n = (size_t)V.sext.width * V.sext.height;
