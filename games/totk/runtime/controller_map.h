@@ -50,12 +50,14 @@ static inline int controller_map_parse(const char *text, uint16_t map[CONTROLLER
     int line = 0;
     for (const char *p = text; p && *p;) {
         line++;
-        const char *end = strchr(p, '\n'), *stop = end ? end : p + strlen(p), *hash = memchr(p, '#', (size_t)(stop - p));
+        const char *end = strchr(p, '\n'), *stop = end ? end : p + strlen(p), *hash = (const char *)memchr(p, '#', (size_t)(stop - p));
         if (hash) stop = hash;
         while (p < stop && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
         while (stop > p && (stop[-1] == ' ' || stop[-1] == '\t' || stop[-1] == '\r')) stop--;
+        /* "key <key> = <Switch button>": a keyboard line (runtime/keyboard_remap.h, Windows), not for this parser */
+        if (stop - p >= 4 && !strncasecmp(p, "key", 3) && (p[3] == ' ' || p[3] == '\t')) { p = end ? end + 1 : NULL; continue; }
         if (p < stop) {
-            const char *eq = memchr(p, '=', (size_t)(stop - p));
+            const char *eq = (const char *)memchr(p, '=', (size_t)(stop - p));
             if (!eq) { *error = "expected \"button = Switch button [hold|tap|toggle]\""; return line; }
             const char *key_end = eq, *value = eq + 1;
             while (key_end > p && (key_end[-1] == ' ' || key_end[-1] == '\t')) key_end--;

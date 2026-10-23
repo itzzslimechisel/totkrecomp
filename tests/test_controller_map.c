@@ -44,6 +44,7 @@ int main(void) {
     expect(press("south = a # trailing comment\neast = a\n", SOUTH | EAST, &line) == A && !line, "two buttons may drive one Switch button");
     expect(press("menu = none\n", MENU | SOUTH, &line) == B && !line, "none leaves a button unused");
     expect(press("north = a\nnorth = b\n", NORTH, &line) == B && !line, "a later line for the same button wins");
+    expect(press("key j = b\nKEY\tspace = none\nsouth = a\n", SOUTH, &line) == A && !line, "keyboard lines (key ...) are skipped");
     expect(press("east = a\nsout = b\n", SOUTH, &line) == B && line == 2, "unknown controller button: line 2, layout unchanged");
     expect(press("south = c\n", SOUTH, &line) == B && line == 1, "unknown Switch button");
     expect(press("south =\n", SOUTH, &line) == B && line == 1, "missing Switch button");

@@ -71,6 +71,22 @@ static int32_t trigger_threshold(void) {
     if (v < 0) { v = env_pct("TOTK_TRIGGER_THRESHOLD", 25, 5, 95); atomic_store(&trigPct, v); }
     return (int32_t)(v * 32767 / 100);
 }
+/* The in-game menu rewrote the controls file: apply its controller lines now (main thread). A bad file keeps the layout. */
+static void refresh(void);
+void gamepad_sdl_reload_controls(void) {
+    const char *path = getenv("TOTK_CONTROLS");
+    uint16_t map[CONTROLLER_BUTTONS]; uint8_t md[CONTROLLER_BUTTONS]; controller_map_default(map, md);
+    FILE *f = path && *path ? fopen(path, "rb") : NULL;
+    if (f) {
+        static char text[16384]; size_t n = fread(text, 1, sizeof text - 1, f); fclose(f); text[n] = 0;
+        const char *error = NULL; int line = controller_map_parse(text, map, md, &error);
+        if (line) { fprintf(stderr, "[totk-input] %s line %d: %s (layout unchanged)\n", path, line, error); return; }
+    }
+    gamepad_modes_init(&modes);
+    memcpy(modes.map, map, sizeof map); memcpy(modes.modes, md, sizeof md);
+    fprintf(stderr, "[totk-input] controller layout reloaded from %s\n", f ? path : "the defaults");
+    refresh();
+}
 static int32_t axis(SDL_Gamepad *g, SDL_GamepadAxis a, int invert) {
     float v = SDL_GetGamepadAxis(g, a) / 32767.0f;
     if (invert) v = -v;   /* SDL: y grows downward; the Switch (and GameController): upward */

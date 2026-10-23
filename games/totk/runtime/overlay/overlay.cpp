@@ -5,6 +5,8 @@
 #endif
 #include <volk.h>
 #include "overlay.h"
+#include "keyboard_remap.h"
+#include "gamepad_sdl_map.h"
 #include "imgui.h"
 #include "backends/imgui_impl_sdl3.h"
 #include "backends/imgui_impl_vulkan.h"
@@ -36,6 +38,7 @@ void gamepad_sdl_set_trigger_threshold(int pct);
 void gamepad_sdl_set_mouse(int on, float sens);
 void gamepad_feedback_set_gain(float g);
 int runtime_hid_feedback_flag(const char *name, int v);
+void runtime_controls_reload(void) __attribute__((weak));
 int prof_win_start(double delay_s, double dur_s, const char *out) __attribute__((weak));
 void vk_pipe_stats(uint64_t *made, uint64_t *ns, int *pending) __attribute__((weak));
 void vk_rt_stats(uint64_t *translated, uint64_t *hits, uint64_t *misses) __attribute__((weak));
@@ -61,7 +64,11 @@ VkDevice g_dev;
 int g_fpsMode = -1;          /* 0 off, 1 FPS, 2 FPS + frame time */
 std::atomic<bool> g_confirmQuit{false};   /* main thread (B) and render thread */
 /* Window actions asked for by the render thread (menu items) and done by the SDL main thread (overlay_main_tick). */
-enum { REQ_TOGGLE = 1, REQ_FULLSCREEN = 2, REQ_WINSIZE = 4, REQ_MOUSE = 8 };
+enum { REQ_TOGGLE = 1, REQ_FULLSCREEN = 2, REQ_WINSIZE = 4, REQ_MOUSE = 8, REQ_CONTROLS = 16 };
+/* Button remapping: the button being rebound (-1 none) and what was pressed for it (main thread -> render thread). */
+std::atomic<int> g_capture{-1}, g_capKey{0}, g_capPhys{-1};
+bool g_remapView;   /* Controls > Remap buttons is shown */
+int g_sel, g_tab;   /* the selected row and tab of the menu */
 std::atomic<int> g_req{0}, g_reqFullscreen{0};
 std::atomic<bool> g_fullscreen{false};    /* the window's state, kept by the main thread */
 std::atomic<bool> g_swapRecreate{false};  /* VSync changed: the backend makes a new swapchain after this present */
@@ -109,6 +116,7 @@ extern "C" void overlay_main_tick(void) {   /* SDL main thread, each loop */
     int r = g_req.exchange(0);
     if (r & REQ_TOGGLE) overlay_toggle();
     if (r & REQ_FULLSCREEN) { SDL_SetWindowFullscreen(g_win, g_reqFullscreen.load() != 0); g_fullscreen = g_reqFullscreen.load() != 0; }
+    if ((r & REQ_CONTROLS) && runtime_controls_reload) runtime_controls_reload();
     if (r & REQ_MOUSE) {   /* the relative mouse mode follows when the menu closes (overlay_toggle) */
         const char *m = getenv("TOTK_MOUSE"), *s = getenv("TOTK_MOUSE_SENS");
         gamepad_sdl_set_mouse(m && !strcmp(m, "1"), s && *s ? (float)atof(s) : 1200.0f);
@@ -120,6 +128,20 @@ extern "C" void overlay_main_tick(void) {   /* SDL main thread, each loop */
 }
 
 extern "C" int overlay_event(const SDL_Event *e) {
+    if (g_open && g_capture.load() >= 0) {   /* "press the new key / button": the next key or controller button is taken */
+        if (e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {
+            if (e->key.scancode == SDL_SCANCODE_F1 || e->key.scancode == SDL_SCANCODE_ESCAPE) g_capture = -1;   /* cancel */
+            else g_capKey = (int)e->key.scancode;
+            return 1;
+        }
+        if (e->type == SDL_EVENT_KEY_UP || e->type == SDL_EVENT_TEXT_INPUT) return 1;
+        if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) { int b = gamepad_sdl_physical_bit(e->gbutton.button); if (b >= 0) g_capPhys = b; return 0; }
+        if (e->type == SDL_EVENT_GAMEPAD_BUTTON_UP) return 0;
+        if (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && e->gaxis.value > 20000 &&
+            (e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER || e->gaxis.axis == SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)) {
+            g_capPhys = e->gaxis.axis == SDL_GAMEPAD_AXIS_LEFT_TRIGGER ? 8 : 9; return 0;
+        }
+    }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 || e->key.scancode == SDL_SCANCODE_ESCAPE)) { overlay_toggle(); return 1; }
@@ -145,7 +167,7 @@ extern "C" int overlay_event(const SDL_Event *e) {
             case SDL_GAMEPAD_BUTTON_SOUTH: push_key(SDLK_RETURN, SDL_SCANCODE_RETURN, down); break;
             case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: push_key(SDLK_PAGEUP, SDL_SCANCODE_PAGEUP, down); break;      /* LB / RB: tabs */
             case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: push_key(SDLK_PAGEDOWN, SDL_SCANCODE_PAGEDOWN, down); break;
-            case SDL_GAMEPAD_BUTTON_EAST: if (down) { if (g_confirmQuit) g_confirmQuit = false; else overlay_toggle(); } break;
+            case SDL_GAMEPAD_BUTTON_EAST: if (down) { if (g_confirmQuit) g_confirmQuit = false; else if (g_remapView) { g_remapView = false; g_sel = 0; } else overlay_toggle(); } break;
             default: break;
             }
         }
@@ -345,6 +367,7 @@ static std::vector<Row> tab_rows(int tab) {
         Row fb; fb.label = "Face buttons"; fb.next_start = true; { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); fb.value = faces[i < 0 ? 0 : i].label; }
         fb.change = [](int d) { int i = choice_index(faces, 3, env("TOTK_FACE_BUTTONS")); i = ((i < 0 ? 0 : i) + d + 3) % 3; settings_ini_set("TOTK_FACE_BUTTONS", faces[i].value[0] ? faces[i].value : nullptr); };
         r.push_back(fb);
+        Row rm; rm.label = "Remap buttons..."; rm.activate = [] { g_remapView = true; g_sel = 0; }; r.push_back(rm);
     } else if (tab == 4) {   /* Interface */
         static const int scales[] = {80, 90, 100, 115, 130, 150};
         Row sc; sc.label = "Menu size"; { char b[16]; snprintf(b, sizeof b, "%d %%", env_int("TOTK_MENU_SCALE", 100)); sc.value = b; }
@@ -382,7 +405,6 @@ static std::vector<Row> tab_rows(int tab) {
    value (on the top row: the tab), Enter / A activates, Q / E or LB / RB switch tabs. The mouse works through ImGui. */
 enum { NAV_UP, NAV_DOWN, NAV_LEFT, NAV_RIGHT, NAV_OK, NAV_TAB_PREV, NAV_TAB_NEXT };
 static std::vector<int> g_nav;
-static int g_sel, g_tab;
 static bool g_mouseMoved; static ImVec2 g_mouseAtOpen(-1, -1);
 static const char *kTabs[] = {"Game", "Video", "Audio", "Controls", "Interface", "Advanced"};
 #define kNumTabs (env_int("TOTK_MENU_ADVANCED", 0) ? 6 : 5)
@@ -412,12 +434,128 @@ static void quit_game() {
     g_confirmQuit = false;
 }
 
+/* ---------- button remapping (Controls > Remap buttons...) ---------- */
+static std::string g_remapNote;
+static const char *kSwitchNames[16] = {"A", "B", "X", "Y", "L-stick click", "R-stick click", "L", "R", "ZL", "ZR", "+", "-", "D-pad left", "D-pad up", "D-pad right", "D-pad down"};
+static const char *kPhysNames[CONTROLLER_BUTTONS] = {"bottom face (A / Cross)", "right face (B / Circle)", "left face (X / Square)", "top face (Y / Triangle)",
+    "left stick click", "right stick click", "LB / L1", "RB / R1", "LT / L2", "RT / R2", "Start / Menu", "Back / View", "D-pad left", "D-pad up",
+    "D-pad right", "D-pad down", "touchpad"};
+struct Controls { uint16_t map[CONTROLLER_BUTTONS]; uint8_t modes[CONTROLLER_BUTTONS]; uint8_t keys[256]; };
+static std::string controls_path() {
+    const char *e = getenv("TOTK_CONTROLS");
+    if (!e || !*e) { settings_ini_set("TOTK_CONTROLS", "%~dp0controls.txt"); e = getenv("TOTK_CONTROLS"); }   /* next to the package */
+    return e ? e : "controls.txt";
+}
+static void controls_load(Controls &c) {
+    controller_map_default(c.map, c.modes); memset(c.keys, KEYREMAP_KEEP, sizeof c.keys);
+    FILE *f = fopen(controls_path().c_str(), "rb"); if (!f) return;
+    static char text[16384]; size_t n = fread(text, 1, sizeof text - 1, f); fclose(f); text[n] = 0;
+    const char *err = NULL;
+    if (controller_map_parse(text, c.map, c.modes, &err)) controller_map_default(c.map, c.modes);
+    if (keyremap_parse(text, c.keys, &err)) memset(c.keys, KEYREMAP_KEEP, sizeof c.keys);
+}
+static void controls_save(const Controls &c) {
+    uint16_t dm[CONTROLLER_BUTTONS]; uint8_t dmo[CONTROLLER_BUTTONS]; controller_map_default(dm, dmo);
+    std::string o = "# Controls, written by the in-game menu (Controls > Remap buttons). Lines:\n"
+                    "#   <controller button> = <Switch button | none> [hold | tap | toggle | aim <fire button>]\n"
+                    "#   key <key> = <Switch button | none>\n";
+    static const char *mname[4] = {"", " tap", " toggle", " aim"};
+    for (int i = 0; i < CONTROLLER_BUTTONS; i++) {
+        if (c.map[i] == dm[i] && c.modes[i] == CONTROLLER_HOLD) continue;
+        int t = -1; for (int b = 0; b < 16; b++) if (c.map[i] & (1u << b)) { t = b; break; }
+        o += std::string(controller_physical_names[i]) + " = " + (t < 0 ? "none" : controller_switch_names[t]);
+        int k = controller_mode_kind(c.modes[i]); if (t >= 0 && k) { o += mname[k & 3]; if (k == CONTROLLER_AIM) o += std::string(" ") + controller_physical_names[controller_mode_fire(c.modes[i])]; }
+        o += "\n";
+    }
+    char nb[2];
+    for (unsigned u = 1; u < 256; u++) {
+        if (c.keys[u] == KEYREMAP_KEEP) continue;
+        const char *kn = keyremap_name_of(u, nb); if (!kn) continue;
+        o += std::string("key ") + kn + " = " + (c.keys[u] == KEYREMAP_NONE ? "none" : controller_switch_names[c.keys[u]]) + "\n";
+    }
+    std::string path = controls_path(), tmp = path + ".tmp";
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f || fwrite(o.data(), 1, o.size(), f) != o.size()) { if (f) fclose(f); g_remapNote = "Could not write " + path; return; }
+    fclose(f); MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    request_main(REQ_CONTROLS, 1);
+}
+static std::string key_label(unsigned usage) {   /* "J", "Space", "Left Alt" ... for the menu */
+    static const struct { const char *name, *label; } nice[] = {{"lalt", "Left Alt"}, {"lshift", "Left Shift"}, {"lbracket", "["}, {"rbracket", "]"},
+        {"backslash", "\\"}, {"semicolon", ";"}, {"quote", "'"}, {"grave", "`"}, {"comma", ","}, {"period", "."}, {"slash", "/"}, {"minus", "-"}, {"equals", "="}};
+    char nb[2]; const char *n = usage ? keyremap_name_of(usage, nb) : nullptr;
+    if (!n) return "-";
+    for (auto &e : nice) if (!strcmp(e.name, n)) return e.label;
+    std::string s = n; s[0] = (char)toupper((unsigned char)s[0]); return s;
+}
+static int pad_of(const Controls &c, int button) { for (int i = 0; i < CONTROLLER_BUTTONS; i++) if (c.map[i] & (1u << button)) return i; return -1; }
+static void bind_pad(Controls &c, int button, int phys) {   /* phys drives button; its old button goes to the one that drove button (swap) */
+    int q = pad_of(c, button);
+    uint16_t old = c.map[phys];
+    c.map[phys] = (uint16_t)(1u << button); c.modes[phys] = CONTROLLER_HOLD;
+    if (q >= 0 && q != phys) { c.map[q] = old; c.modes[q] = CONTROLLER_HOLD; }
+}
+static void remap_page(float w) {
+    Controls c; controls_load(c);
+    int cap = g_capture.load();
+    if (cap >= 0) {   /* a press arrived for the button being rebound */
+        int key = g_capKey.exchange(0), phys = g_capPhys.exchange(-1);
+        char nb[2];
+        if (key > 0 && key < 256 && keyremap_name_of((unsigned)key, nb)) { keyremap_bind(c.keys, cap, (unsigned)key); controls_save(c); g_capture = -1; g_remapNote = std::string(kSwitchNames[cap]) + " is now the " + key_label((unsigned)key) + " key"; }
+        else if (key > 0) { g_remapNote = "That key cannot be used; press another (Esc cancels)"; }
+        else if (phys >= 0) { bind_pad(c, cap, phys); controls_save(c); g_capture = -1; g_remapNote = std::string(kSwitchNames[cap]) + " is now " + kPhysNames[phys]; }
+    }
+    const int nrows = 18;   /* 16 buttons, reset, back */
+    for (int a : g_nav) {
+        if (g_capture.load() >= 0) continue;
+        if (a == NAV_UP) g_sel = (g_sel + nrows - 1) % nrows;
+        else if (a == NAV_DOWN) g_sel = (g_sel + 1) % nrows;
+        else if (a == NAV_OK) {
+            if (g_sel < 16) { g_capKey = 0; g_capPhys = -1; g_capture = g_sel; g_remapNote.clear(); }
+            else if (g_sel == 16) { controller_map_default(c.map, c.modes); memset(c.keys, KEYREMAP_KEEP, sizeof c.keys); controls_save(c); g_remapNote = "Keyboard and controller back to the default layout"; }
+            else { g_remapView = false; g_sel = 0; }
+        }
+    }
+    g_nav.clear();
+    ImGui::TextDisabled("Choose a button, then press the key or controller button for it. The old one swaps over.");
+    ImGui::Separator();
+    const float pad = ImGui::GetStyle().FramePadding.x, c1 = w * 0.26f, c2 = w * 0.52f;   /* column starts */
+    { ImVec2 p = ImGui::GetCursorScreenPos(); ImDrawList *dl = ImGui::GetWindowDrawList(); ImU32 col = ImGui::GetColorU32(ImGuiCol_TextDisabled);
+      dl->AddText(ImVec2(p.x + pad, p.y), col, "Switch button"); dl->AddText(ImVec2(p.x + c1, p.y), col, "Keyboard"); dl->AddText(ImVec2(p.x + c2, p.y), col, "Controller");
+      ImGui::Dummy(ImVec2(w, ImGui::GetTextLineHeightWithSpacing())); }
+    for (int b = 0; b < 16; b++) {
+        unsigned k = keyremap_key_of(c.keys, b); int ph = pad_of(c, b);
+        char id[16]; snprintf(id, sizeof id, "##remap%d", b);
+        if (row_button(id, b, w) && g_capture.load() < 0) { g_capKey = 0; g_capPhys = -1; g_capture = b; g_remapNote.clear(); }
+        ImVec2 r0 = ImGui::GetItemRectMin(), r1 = ImGui::GetItemRectMax(); float ty = r0.y + (r1.y - r0.y - ImGui::GetTextLineHeight()) * 0.5f;
+        ImDrawList *dl = ImGui::GetWindowDrawList(); ImU32 col = ImGui::GetColorU32(ImGuiCol_Text);
+        dl->AddText(ImVec2(r0.x + pad, ty), col, kSwitchNames[b]);
+        if (g_capture.load() == b) dl->AddText(ImVec2(r0.x + c1, ty), col, "press a key or controller button...   (Esc cancels)");
+        else { dl->AddText(ImVec2(r0.x + c1, ty), col, key_label(k).c_str()); dl->AddText(ImVec2(r0.x + c2, ty), col, ph >= 0 ? kPhysNames[ph] : "-"); }
+    }
+    ImGui::Spacing();
+    if (row_button("Reset to default", 16, w * 0.49f)) { controller_map_default(c.map, c.modes); memset(c.keys, KEYREMAP_KEEP, sizeof c.keys); controls_save(c); g_remapNote = "Keyboard and controller back to the default layout"; }
+    ImGui::SameLine();
+    if (row_button("Back", 17, ImGui::GetContentRegionAvail().x)) { g_remapView = false; g_sel = 0; }
+    if (!g_remapNote.empty()) ImGui::TextWrapped("%s", g_remapNote.c_str());
+    ImGui::TextDisabled("Saved to %s; applied at once.", controls_path().c_str());
+}
+
 static void menu_window() {
     ImGuiIO &io = ImGui::GetIO();
     static bool wasConfirm;
     if (wasConfirm != g_confirmQuit) { g_sel = g_confirmQuit ? 1 : 0; wasConfirm = g_confirmQuit; }   /* the dialog opens on Cancel */
     if (g_mouseAtOpen.x < 0 && ImGui::IsMousePosValid()) g_mouseAtOpen = io.MousePos;
     if (!g_mouseMoved && g_mouseAtOpen.x >= 0 && (fabsf(io.MousePos.x - g_mouseAtOpen.x) + fabsf(io.MousePos.y - g_mouseAtOpen.y)) > 6) g_mouseMoved = true;
+    if (g_remapView && !g_confirmQuit) {
+        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, env_int("TOTK_MENU_DIM", 55) * 255 / 100));
+        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSize(ImVec2(io.DisplaySize.y * 1.05f * io.FontGlobalScale, 0));
+        ImGui::Begin("Remap buttons", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+                     ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
+        remap_page(ImGui::GetContentRegionAvail().x);
+        ImGui::End();
+        return;
+    }
     std::vector<Row> rows = tab_rows(g_tab);
     const int n = g_confirmQuit ? 2 : (int)rows.size() + 1;   /* row 0 = the tab selector */
     for (int a : g_nav) {
@@ -508,7 +646,7 @@ extern "C" int overlay_vk_draw(const overlay_vk_frame *f) {
     if (g_accNs >= 500000000ull) { g_fps = g_accFrames * 1e9f / g_accNs; g_ms = g_accNs / 1e6f / g_accFrames; g_accNs = 0; g_accFrames = 0; }
     if (g_fpsMode < 0) g_fpsMode = fps_mode_setting();
     bool open = g_open.load();
-    { static bool was; if (open && !was) { g_sel = 1; g_tab = 0; g_ndev = -1; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
+    { static bool was; if (open && !was) { g_sel = 1; g_tab = 0; g_ndev = -1; g_remapView = false; g_capture = -1; g_mouseMoved = false; g_mouseAtOpen = ImVec2(-1, -1); } was = open; }   /* the menu opens on Resume */
     if (!open) { std::lock_guard<std::mutex> l(g_qmu); g_q.clear(); g_confirmQuit = false; }
     if (!g_win || (!open && !g_fpsMode) || f->image_index >= 8) return 0;
     if (!g_ready) { if (!init_imgui(f)) { g_win = nullptr; fprintf(stderr, "[totk-menu] initialization failed: menu off\n"); return 0; } g_ready = true; }

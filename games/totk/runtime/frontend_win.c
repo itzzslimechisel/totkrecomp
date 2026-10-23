@@ -27,6 +27,7 @@
 #include "runtime.h"
 #include "game_version.h"
 #include "keymap_sdl.h"
+#include "keyboard_remap.h"
 #include "frontend_sdl.h"
 #include "../third_party/d2r_gfx/host/front.h"
 
@@ -286,6 +287,23 @@ static void close_window(void) {
     if (t) CloseHandle(t); else _exit(0);
 }
 
+/* Keyboard rebinding (keyboard_remap.h): the "key" lines of the controls file (TOTK_CONTROLS). */
+static uint8_t keyTable[256];
+void gamepad_sdl_reload_controls(void);
+static void keys_reload(void) {
+    memset(keyTable, KEYREMAP_KEEP, sizeof keyTable);
+    const char *path = getenv("TOTK_CONTROLS");
+    FILE *f = path && *path ? fopen(path, "rb") : NULL;
+    if (!f) return;
+    static char text[16384]; size_t n = fread(text, 1, sizeof text - 1, f); fclose(f); text[n] = 0;
+    const char *error = NULL; int line = keyremap_parse(text, keyTable, &error);
+    if (line) fprintf(stderr, "[totk-input] %s line %d: %s (keyboard keeps the default keys)\n", path, line, error);
+    int changed = 0; for (int i = 0; i < 256; i++) changed += keyTable[i] != KEYREMAP_KEEP;
+    if (changed) fprintf(stderr, "[totk-input] keyboard: %d keys rebound (%s)\n", changed, path);
+}
+/* In-game menu: the controls file changed (main thread). */
+void runtime_controls_reload(void) { keys_reload(); gamepad_sdl_reload_controls(); }
+
 static void handle_key(const SDL_KeyboardEvent *k) {
     int down = k->type == SDL_EVENT_KEY_DOWN;
     if (down && !k->repeat && (k->scancode == SDL_SCANCODE_F11 || (k->scancode == SDL_SCANCODE_RETURN && (k->mod & SDL_KMOD_ALT)))) {
@@ -301,7 +319,10 @@ static void handle_key(const SDL_KeyboardEvent *k) {
     }
     SDL_UnlockMutex(uiLock);
     if (typing) return;   /* the entry has the keyboard */
-    unsigned code = keymap_mac_from_hid((unsigned)k->scancode);
+    unsigned sc = (unsigned)k->scancode, code;
+    uint8_t to = sc < 256 ? keyTable[sc] : KEYREMAP_KEEP;
+    if (to == KEYREMAP_NONE) return;
+    code = to != KEYREMAP_KEEP ? keymap_mac_from_hid(keyremap_default_key(to)) : keymap_mac_from_hid(sc);
     if (code != KEYMAP_NONE) runtime_input_key(code, down);
 }
 
@@ -361,6 +382,7 @@ int front_window_create(int hidden) {
     if (!window) { fprintf(stderr, "[totk] window creation failed: %s\n", SDL_GetError()); return 0; }
     { const char *fs = getenv("TOTK_FULLSCREEN"); if (fs && !strcmp(fs, "1") && !hidden) SDL_SetWindowFullscreen(window, true); }   /* start in borderless fullscreen (launcher setting) */
     sync_drawable();
+    keys_reload();
     if (overlay_init) overlay_init(window);
     return 1;
 }

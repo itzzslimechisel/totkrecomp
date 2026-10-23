@@ -721,7 +721,7 @@ static void page_controls() {
     ImGui::SeparatorText("Mouse");
     ImGui::TextWrapped("Optional (Settings > Input): the mouse moves the right stick; left / right / middle button = ZR / ZL / R3.");
     ImGui::SeparatorText("More");
-    ImGui::TextWrapped("The button layout can be remapped with controls.txt (see README-windows.md). This window opens every time you start \"Tears of the Kingdom.exe\".");
+    ImGui::TextWrapped("Keys and controller buttons can be rebound in the game: F1 > Controls > Remap buttons (saved to controls.txt, see README-windows.md). This window opens every time you start \"Tears of the Kingdom.exe\".");
     if (ImGui::Button("Open package folder")) open_path(here);
 }
 
