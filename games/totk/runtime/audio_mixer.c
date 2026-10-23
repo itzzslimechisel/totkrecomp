@@ -152,7 +152,8 @@ static void pull_raw(void *ctx, float *out, uint32_t frames) {
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
 }
 static void output_open(Mixer *m, int rate) {
-    if (getenv("TOTK_AUDIO_OFF")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without a %s device\n", audio_out_backend()); return; }
+    { const char *off = getenv("TOTK_AUDIO_OFF");   /* settings.ini writes TOTK_AUDIO_OFF=0 for sound on */
+      if (off && *off && strcmp(off, "0")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without a %s device\n", audio_out_backend()); return; } }
     m->out = audio_out_open(rate, 2, pull, m);   /* the backend logs its own failure: mixing without sound */
     m->unit_ok = m->out != NULL;
 }
