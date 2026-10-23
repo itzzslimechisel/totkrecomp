@@ -102,8 +102,21 @@ def package_args(pkg):
 
 
 def load_index(cache):
-    """key -> {canonical deps: variant} from <cache>/<key>.variants.tsv (lines: variant, depth_minus_w, deps)."""
+    """key -> {canonical deps: variant} from <cache>/index.tsv (one file; lines: key, variant, depth_minus_w, deps), or
+    from the per-key <cache>/<key>.variants.tsv files (lines: variant, depth_minus_w, deps) when an older cache has no
+    index.tsv. Reading 20 000 small files took a minute or more even with nothing left to translate."""
     idx = {}
+    combined = cache / 'index.tsv'
+    if combined.is_file():
+        for line in combined.read_text(encoding='utf-8', errors='replace').splitlines():
+            parts = line.split('\t')
+            if len(parts) != 4 or len(parts[0]) != 64 or parts[2] != str(DMW):
+                continue
+            try:
+                idx.setdefault(parts[0], {})[canon(json.loads(parts[3]))] = parts[1]
+            except ValueError:
+                pass
+        return idx
     for p in cache.glob('*.variants.tsv'):
         key = p.name[:64]
         lines = p.read_text(encoding='utf-8', errors='replace').splitlines()
