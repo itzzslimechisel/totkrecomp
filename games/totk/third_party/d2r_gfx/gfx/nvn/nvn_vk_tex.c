@@ -208,6 +208,20 @@ static vk_tex *tex_create(const tex_t *t) {
 }
 
 static uint64_t tex_hash(const tex_t *t) { return vk_hash(t->mem, (size_t)t->L.size, 0); }
+/* The game may render into one texture object and sample the same memory through another (the HUD minimap: drawn into
+   a 288x288 target, read through a second texture at the same address). Each object has its own image here, so the
+   sampled one was never written and showed uninitialised memory. A texture that is neither uploaded from the pool nor
+   written by the GPU samples a written texture over the same memory with the same layout instead. Holding g_tmu. */
+static int tex_same_layout(const vk_tex *a, const vk_tex *b) {
+    return a->fmt == b->fmt && a->w == b->w && a->h == b->h && a->d == b->d && a->layers == b->layers && a->samples == b->samples && a->levels <= b->levels;
+}
+static vk_tex *tex_alias(vk_tex *x) {
+    if (x->alias_serial) { vk_tex *y = tab_get(x->alias_serial); if (y && y->gpu_written && y->t.mem == x->t.mem && tex_same_layout(x, y)) return y; x->alias_serial = 0; }
+    uint64_t seq = vk_sub_current()->seq; if (x->alias_sub == seq + 1) return NULL; x->alias_sub = seq + 1;   // look at most once per submission
+    for (int b = 0; b < TB; b++) for (vk_tex *y = g_tab[b]; y; y = y->hnext)
+        if (y != x && y->gpu_written && y->img && y->t.mem == x->t.mem && tex_same_layout(x, y)) { x->alias_serial = y->serial; return y; }
+    return NULL;
+}
 vk_tex *vk_tex_get(const tex_t *t, int for_render) {
     if (!t || !t->serial || !V.ok) return NULL;
     pthread_mutex_lock(&g_tmu);
@@ -217,6 +231,7 @@ vk_tex *vk_tex_get(const tex_t *t, int for_render) {
         if (!x) { pthread_mutex_unlock(&g_tmu); return NULL; }
         x->hnext = g_tab[t->serial % TB]; g_tab[t->serial % TB] = x;
     }
+    if (!for_render && !x->mirrored && !x->gpu_written && t->mem) { vk_tex *y = tex_alias(x); if (y) { pthread_mutex_unlock(&g_tmu); return y; } }
     pthread_mutex_unlock(&g_tmu);
     if (for_render) { x->gpu_written = 1; return x; }
     if (x->mirrored && !x->gpu_written && x->img) {

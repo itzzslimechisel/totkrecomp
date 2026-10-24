@@ -118,6 +118,7 @@ typedef struct vk_tex {
     VkBufferView bview; uint64_t bview_addr;   // TARGET_BUFFER
     int mirrored, decoded;           // mirrored: uploaded from pool bytes; decoded: CPU-transcoded (BC / ASTC fallback)
     uint32_t up_gen; uint64_t up_hash; uint64_t up_sub; int uploaded, gpu_written;
+    uint64_t alias_serial, alias_sub;   // a GPU-written texture over the same memory that sampling uses instead (vk_tex_get)
     uint8_t cswz[4];                 // component mapping of the format substitution
     vk_view *views;
     struct vk_tex *hnext;
