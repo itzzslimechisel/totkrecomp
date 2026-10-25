@@ -282,6 +282,16 @@ export PATH=\"/usr/bin:$(cygpath -u '${_cc_dir}'):$PATH\"
   target_compile_options(totk-win PRIVATE -include ${RUNTIME_DIR}/win/win_posix.h -Wno-sign-compare -Wno-missing-field-initializers
     -Wno-unused-function -Wno-unused-variable -Wno-unused-but-set-variable)
   target_link_libraries(totk-win PRIVATE totk_cpu totk_platform opus bcrypt ole32 avrt winmm psapi -static -lpthread)
+  # Static recompiler (tools/recomp): TOTK_RECOMP_DIR = the generated C of your own game files (never committed);
+  # the game uses it only with TOTK_CPU=static (runtime/cpu_static/rc_support.c).
+  set(TOTK_RECOMP_DIR "" CACHE PATH "tools/recomp output to link (empty: none)")
+  if(TOTK_RECOMP_DIR)
+    file(GLOB TOTK_RECOMP_SRC ${TOTK_RECOMP_DIR}/rc_*.c)
+    add_library(totk_recomp STATIC ${TOTK_RECOMP_SRC} runtime/cpu_static/rc_support.c)
+    target_include_directories(totk_recomp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime/cpu_static ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+    target_compile_options(totk_recomp PRIVATE -O2 -march=x86-64-v3 -fno-strict-aliasing -w)
+    target_link_libraries(totk-win PRIVATE -Wl,--whole-archive totk_recomp -Wl,--no-whole-archive)
+  endif()
   target_include_directories(totk-win PRIVATE ${totk_opus_SOURCE_DIR}/include)
   if(TOTK_VPX_LIB)
     target_sources(totk-win PRIVATE ${RUNTIME_DIR}/movie_host.c)

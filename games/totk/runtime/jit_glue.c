@@ -243,6 +243,7 @@ static int on_data_abort(cpu_context *ctx, uint64_t pc, uint64_t addr, int is_wr
     fprintf(stderr, "[totk-jit] guest data abort: %s %#llx at %s\n", is_write ? "write" : "read", (unsigned long long)addr, where);
     return 0;
 }
+void jit_svc_static(cpu_context *ctx, uint32_t imm) { on_svc(ctx, imm, NULL); }   /* cpu_static/rc_support.c */
 void jit_init(void) {
     cpu_backend_config cfg = {0};
     cfg.max_contexts = MAX_CONTEXTS;

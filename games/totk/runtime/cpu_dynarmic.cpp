@@ -535,6 +535,37 @@ uint64_t cpu_call_guest(cpu_context *ctx, uint64_t fn, const uint64_t *args, int
     return result;
 }
 
+int cpu_call_guest_full(cpu_context *ctx, uint64_t pc, uint64_t regs[31], uint64_t *sp, uint64_t *nzcv) {
+    const int d = ctx->depth;
+    if (d == 0) return 0;   // only from inside guest execution (a host trap or an svc handler)
+    Dynarmic::A64::Jit *parent = ctx->active();
+    Dynarmic::A64::Jit *j = ctx->level(d)->jit.get();
+    std::array<uint64_t, 31> r{};
+    for (int i = 0; i < 31; i++) r[i] = regs[i];
+    r[30] = g_backend->return_addr;
+    j->SetRegisters(r);
+    j->SetVectors(parent->GetVectors());
+    j->SetSP(*sp);
+    j->SetPC(pc);
+    j->SetPstate((uint32_t)*nzcv);
+    j->SetFpcr(parent->GetFpcr());
+    j->SetFpsr(parent->GetFpsr());
+    j->ClearExclusiveState();
+    cpu_context *prev = t_current;
+    t_current = ctx;
+    ctx->depth = d + 1;
+    int res = run_level(ctx, j, true);
+    ctx->depth = d;
+    t_current = prev;
+    r = j->GetRegisters();
+    for (int i = 0; i < 30; i++) regs[i] = r[i];
+    *sp = j->GetSP();
+    *nzcv = j->GetPstate();
+    parent->SetVectors(j->GetVectors());
+    parent->SetFpsr(j->GetFpsr());
+    return res == CPU_HALT_RETURNED;
+}
+
 int cpu_register_host_trap(uint64_t addr, void *fn, const char *sig) {
     Trap t;
     if (!g_backend || !fn || (addr & 3) || !addr || addr >= kAddrLimit || !parse_sig(sig, t)) return -1;

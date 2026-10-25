@@ -103,6 +103,12 @@ void cpu_request_halt(cpu_context *ctx);
  * set to 0 if the call ended with an exception instead of returning. */
 uint64_t cpu_call_guest(cpu_context *ctx, uint64_t fn, const uint64_t *args, int nargs, int *ok);
 
+/* Like cpu_call_guest with the whole integer state: runs guest code at pc with x0..x30 (x30 is replaced by the return
+ * sentinel), SP and NZCV (pstate bits) from the arguments and the caller's vector / FP state, until it returns; then
+ * writes x0..x29, SP and NZCV back and gives the vector / FP state to the caller. Only from inside guest execution
+ * (a host trap, an svc handler). Returns 1 if it returned normally. Used by the static recompiler (cpu_static). */
+int cpu_call_guest_full(cpu_context *ctx, uint64_t pc, uint64_t regs[31], uint64_t *sp, uint64_t *nzcv);
+
 /* Guest address that ends cpu_call_guest / makes cpu_run return CPU_HALT_RETURNED when branched to (use as LR). */
 uint64_t cpu_return_address(void);
 

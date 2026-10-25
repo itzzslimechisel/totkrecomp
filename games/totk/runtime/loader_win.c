@@ -465,6 +465,7 @@ int main(int argc, char **argv) {
     for (unsigned i = 0; i < NSEARCH; i++)
         fprintf(stderr, "[totk] linked %s: relative=%u symbolic=%u cross=%u weak_zero=%u\n", modules[i].name, modules[i].relative, modules[i].symbolic, modules[i].cross, modules[i].weak);
     runtime_game_patches(&modules[0]);
+    { extern void runtime_static_init(void) __attribute__((weak)); if (runtime_static_init) runtime_static_init(); }   /* TOTK_CPU=static (cpu_static) */
     for (unsigned i = 0; i < NM; i++) seal(&modules[i]);
     if (!strcmp(argv[2], "boot")) {
 #ifdef TOTK_WIN_FRONTEND
